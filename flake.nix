@@ -74,7 +74,7 @@
           pname = "loglog-workspace-deps";
         });
 
-        workspaceTests = craneLib.cargoBuild (commonArgs // {
+        workspaceAll = craneLib.cargoBuild (commonArgs // {
           cargoArtifacts = workspaceDeps;
           doCheck = true;
         });
@@ -88,6 +88,7 @@
             src = filterModules [ dir ] ./.;
 
             cargoExtraArgs = "--bin ${name}";
+            doCheck = false;
           });
 
           container = pkgs.dockerTools.buildLayeredImage {
@@ -113,7 +114,7 @@
           loglogd = loglogd.package;
 
           deps = workspaceDeps;
-          test = workspaceTests;
+          ci = workspaceAll;
         };
 
         devShells = {
