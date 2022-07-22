@@ -74,6 +74,11 @@
           pname = "loglog-workspace-deps";
         });
 
+        workspaceTests = craneLib.cargoBuild (commonArgs // {
+          cargoArtifacts = workspaceDeps;
+          doCheck = true;
+        });
+
         # a function to define both package and container build for a given binary
         pkg = { name, dir }: rec {
           package = craneLib.buildPackage (commonArgs // {
@@ -106,11 +111,13 @@
         packages = {
           default = loglogd.package;
           loglogd = loglogd.package;
+
+          deps = workspaceDeps;
+          test = workspaceTests;
         };
 
         devShells = {
           default =
-
             pkgs.mkShell {
               buildInputs = workspaceDeps.buildInputs;
               nativeBuildInputs = workspaceDeps.nativeBuildInputs ++ [
@@ -144,9 +151,9 @@
               '';
             };
 
-          # this shell is used only in CI, so it should contain minimum amount
+          # this shell is used only in CI lints, so it should contain minimum amount
           # of stuff to avoid building and caching things we don't need
-          ci = pkgs.mkShell {
+          lint = pkgs.mkShell {
             nativeBuildInputs = [
               pkgs.rustfmt
               pkgs.nixpkgs-fmt
