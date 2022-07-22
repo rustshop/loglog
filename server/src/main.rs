@@ -411,3 +411,8 @@ async fn handle_fill(
 
     (Ok(()), buf)
 }
+
+#[test]
+fn fail_me() {
+    assert_eq!(1, 2);
+}
