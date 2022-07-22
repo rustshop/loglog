@@ -1,5 +1,4 @@
 use binrw::{BinRead, BinWrite, ReadOptions, WriteOptions};
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use ioutil::{tcpstream_write_all, vec_extend_to_at_least};
 use nix::fcntl::FallocateFlags;
 use node::{Parameters, TermId};
@@ -82,8 +81,8 @@ impl AllocationId {
     pub fn to_bytes(&self) -> [u8; Self::BYTE_SIZE] {
         let mut buf = [0; Self::BYTE_SIZE];
 
-        WriteBytesExt::write_u16::<BigEndian>(&mut &mut buf[..2], self.term.0).expect("Can't fail");
-        WriteBytesExt::write_u64::<BigEndian>(&mut &mut buf[2..], self.pos.0).expect("Can't fail");
+        buf[0..2].copy_from_slice(&self.term.0.to_be_bytes());
+        buf[2..].copy_from_slice(&self.pos.0.to_be_bytes());
 
         buf
     }
@@ -202,9 +201,9 @@ pub struct EntrySize(
 
 impl EntrySize {
     fn parse<R: Read + Seek>(reader: &mut R, _ro: &ReadOptions, _: ()) -> binrw::BinResult<u32> {
-        Ok(u32::from(reader.read_u8()?) << 16
-            | u32::from(reader.read_u8()?) << 8
-            | u32::from(reader.read_u8()?))
+        let mut bytes = [0u8; 3];
+        reader.read_exact(&mut bytes)?;
+        Ok(u32::from(bytes[0]) << 16 | u32::from(bytes[1]) << 8 | u32::from(bytes[2]))
     }
 
     fn write<W: binrw::io::Write + binrw::io::Seek>(
@@ -213,9 +212,8 @@ impl EntrySize {
         _opts: &WriteOptions,
         _: (),
     ) -> binrw::BinResult<()> {
-        writer.write_u8((amount >> 16) as u8)?;
-        writer.write_u8((amount >> 8) as u8)?;
-        writer.write_u8((amount >> 0) as u8)?;
+        let bytes = amount.to_be_bytes();
+        writer.write_all(&bytes[1..])?;
 
         Ok(())
     }

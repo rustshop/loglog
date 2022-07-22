@@ -23,7 +23,6 @@ clap = { version = "3.1.6", features = [ "derive", "env" ] }
 error-stack = "0.1.1"
 tokio = { version = "1.19.2", features = ["macros", "rt", "rt-multi-thread", "signal", "io-util", "net", "sync"] }
 thiserror = "1.0.31"
-byteorder = "1.4.3"
 num_enum = "0.5.7"
 nix = "0.24.2"
 tokio-uring = "0.3.0"
