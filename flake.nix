@@ -64,7 +64,7 @@
                     ([ "Cargo.lock" "Cargo.toml" ".*/Cargo.toml" ] ++ builtins.concatLists (map (name: [ name "${name}/.*" ]) modules));
               in
               # uncomment to debug:
-              # builtins.trace "${relPath}: ${lib.boolToString includePath}"
+                # builtins.trace "${relPath}: ${lib.boolToString includePath}"
               includePath
             );
             inherit src;
@@ -110,7 +110,7 @@
 
         devShells = {
           default =
-            
+
             pkgs.mkShell {
               buildInputs = workspaceDeps.buildInputs;
               nativeBuildInputs = workspaceDeps.nativeBuildInputs ++ [

@@ -54,7 +54,11 @@ impl Node {
         })
     }
 
-    pub async fn get_segment_file(idx: usize, db_path: &Path, size: u64) -> io::Result<OpenSegment> {
+    pub async fn get_segment_file(
+        idx: usize,
+        db_path: &Path,
+        size: u64,
+    ) -> io::Result<OpenSegment> {
         // TODO: this allocs
         OpenSegment::new(&db_path.join(&format!("{idx}.loglog")), size).await
     }
