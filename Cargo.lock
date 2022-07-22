@@ -209,6 +209,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "loglogd-client"
+version = "0.1.0"
+dependencies = [
+ "binrw",
+ "byteorder",
+ "clap",
+ "error-stack",
+ "nix",
+ "num_enum",
+ "thiserror",
+ "tokio",
+ "tokio-uring",
+ "tracing",
+ "tracing-subscriber",
+ "typed-builder",
+]
+
+[[package]]
 name = "matchers"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
