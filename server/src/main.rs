@@ -69,7 +69,7 @@ pub struct LogOffset(u64);
 #[derive(Copy, Clone, BinRead, Debug, PartialEq, Eq)]
 pub struct AllocationId {
     pub term: TermId,
-    pub pos: LogOffset,
+    pub offset: LogOffset,
 }
 
 impl AllocationId {
@@ -80,7 +80,7 @@ impl AllocationId {
         let mut buf = [0; Self::BYTE_SIZE];
 
         buf[0..2].copy_from_slice(&self.term.0.to_be_bytes());
-        buf[2..].copy_from_slice(&self.pos.0.to_be_bytes());
+        buf[2..].copy_from_slice(&self.offset.0.to_be_bytes());
 
         buf
     }
@@ -90,7 +90,7 @@ impl AllocationId {
 fn allocation_id_serde() {
     let v = AllocationId {
         term: TermId(0x0123),
-        pos: LogOffset(0x456789abcdef0011),
+        offset: LogOffset(0x456789abcdef0011),
     };
 
     assert_eq!(
@@ -99,38 +99,6 @@ fn allocation_id_serde() {
     );
 }
 
-/*
-pub struct Segment {
-    file: File,
-    allocated_size: nix::libc::off_t,
-    // The position in the stream of the first entry stored in this file
-    file_stream_start_pos: u64,
-}
-
-impl Segment {
-    async fn new(path: &Path, allocated_size: u64) -> io::Result<Self> {
-        let allocated_size = i64::try_from(allocated_size).expect("not fail");
-        let file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(path)
-            .await?;
-
-        let fd = file.as_raw_fd();
-
-        tokio::task::spawn_blocking(move || {
-            nix::fcntl::fallocate(fd, FallocateFlags::FALLOC_FL_ZERO_RANGE, 0, allocated_size)
-        })
-        .await??;
-
-        Ok(Self {
-            file,
-            allocated_size,
-            file_stream_uuuuu_pos: 0,
-        })
-    }
-}
-*/
 fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
@@ -358,7 +326,7 @@ async fn handle_append(
     buf: Vec<u8>,
     entry_size: EntrySize,
 ) -> ConnectionResult<()> {
-    let allocation_id = node.advance_log_pos(entry_size);
+    let allocation_id = node.allocate_new_entry(entry_size).await;
 
     // TODO: send the allocation id right away, in parallel, flush it, so the client can
     // start uploading to other nodes right away
@@ -450,7 +418,7 @@ async fn handle_fill(
     let _ = node
         .entry_writer_tx
         .send(EntryWrite {
-            offset: allocation_id.pos,
+            offset: allocation_id.offset,
             entry: buf,
         })
         .await;

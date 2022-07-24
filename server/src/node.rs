@@ -1,8 +1,7 @@
 use binrw::{BinRead, BinWrite};
+use std::collections::BTreeSet;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering::SeqCst;
 use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{Mutex, RwLock};
@@ -52,15 +51,24 @@ pub struct OpenSegments {
     /// Segment pre-writing thread will keep sending us new threads through this
     future_rx: Receiver<OpenSegment>,
 }
+
+pub struct EntriesInFlight {
+    /// Next log offset to give out to incoming entry
+    next_available_log_offset: LogOffset,
+
+    /// Entries that were already allocated but were not yet written to storage
+    unwritten: BTreeSet<LogOffset>,
+}
+
 pub struct Node {
     params: Parameters,
     #[allow(unused)]
     id: NodeId,
     pub term: TermId,
-    /// What position in the stream the next entry goes into
-    stream_next_pos: AtomicU64,
     // TODO: split into buckets by size
     entry_buffer_pool: Mutex<Vec<Vec<u8>>>,
+
+    entries_in_flight: RwLock<EntriesInFlight>,
 
     open_segments: RwLock<OpenSegments>,
 
@@ -77,18 +85,18 @@ impl Node {
         entry_writer_tx: Sender<EntryWrite>,
     ) -> io::Result<Self> {
         Ok(Self {
-            stream_next_pos: AtomicU64::from(
-                sealed_segments
-                    .last()
-                    .map(|s| s.content_meta.end_log_offset.0)
-                    .unwrap_or(0),
-            ),
             id: NodeId(0),
             term: TermId(0),
             entry_buffer_pool: Mutex::new(vec![]),
             params,
+            entries_in_flight: RwLock::new(EntriesInFlight {
+                next_available_log_offset: sealed_segments
+                    .last()
+                    .map(|s| s.content_meta.end_log_offset)
+                    .unwrap_or(LogOffset(0)),
+                unwritten: BTreeSet::new(),
+            }),
             sealed_segments: RwLock::new(sealed_segments),
-
             open_segments: RwLock::new(OpenSegments {
                 inner: vec![],
                 future_rx: future_segments,
@@ -118,16 +126,22 @@ impl Node {
     }
 
     /// Allocate a space in the event stream and return allocation id
-    pub fn advance_log_pos(self: &Arc<Self>, len: EntrySize) -> AllocationId {
+    pub async fn allocate_new_entry(self: &Arc<Self>, len: EntrySize) -> AllocationId {
+        let mut write_in_flight = self.entries_in_flight.write().await;
+
+        let offset = write_in_flight.next_available_log_offset;
+        let was_inserted = write_in_flight.unwritten.insert(offset);
+        debug_assert!(was_inserted);
         let alloc = AllocationId {
-            pos: LogOffset(self.stream_next_pos.fetch_add(
-                EntryHeader::BYTE_SIZE_U64 + u64::from(len.0) + EntryTrailer::BYTE_SIZE_U64,
-                SeqCst,
-            )),
+            offset,
             term: self.term,
         };
 
-        trace!(offset = alloc.pos.0, "Advanced log offset");
+        write_in_flight.next_available_log_offset = LogOffset(
+            offset.0 + EntryHeader::BYTE_SIZE_U64 + u64::from(len.0) + EntryTrailer::BYTE_SIZE_U64,
+        );
+
+        trace!(offset = alloc.offset.0, "Allocated new entry");
 
         alloc
     }
@@ -169,6 +183,8 @@ impl Node {
         if let Err(e) = res {
             panic!("IO Error when writing log: {}, crashing immediately", e);
         }
+
+        self.mark_entry_written(offset).await;
 
         self.put_entry_buffer(res_buf).await;
     }
@@ -259,6 +275,12 @@ impl Node {
         .await;
 
         new_segment
+    }
+
+    pub async fn mark_entry_written(self: &Arc<Node>, log_offset: LogOffset) {
+        let mut write_in_flight = self.entries_in_flight.write().await;
+        let was_removed = write_in_flight.unwritten.remove(&log_offset);
+        debug_assert!(was_removed);
     }
 
     pub async fn run_segment_preloading_loop(
