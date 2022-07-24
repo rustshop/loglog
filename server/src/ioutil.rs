@@ -3,6 +3,7 @@ use tokio_uring::{
     fs::File,
     net::TcpStream,
 };
+use tracing::trace;
 
 use crate::{ConnectionError, RingConnectionResult};
 
@@ -78,6 +79,7 @@ pub async fn file_write_all(
     mut file_pos: u64,
 ) -> RingConnectionResult<()> {
     while !buf.is_empty() {
+        trace!(file_pos, size = buf.len(), "File write all");
         let (res, ret_buf) = stream.write_at(buf, file_pos).await;
         buf = ret_buf;
 

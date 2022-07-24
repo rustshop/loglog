@@ -1,5 +1,5 @@
 use std::{
-    io::{BufReader, Seek},
+    io::{BufReader, Cursor, Seek},
     os::unix::prelude::AsRawFd,
     path::{Path, PathBuf},
 };
@@ -10,10 +10,17 @@ use binrw::{
 };
 use nix::{fcntl::FallocateFlags, unistd::ftruncate};
 use thiserror::Error;
-use tokio_uring::fs::{File, OpenOptions};
+use tokio_uring::{
+    buf::IoBuf,
+    fs::{File, OpenOptions},
+};
 use tracing::{debug, info, warn};
 
-use crate::{node::TermId, EntrySize, LogOffset};
+use crate::{
+    ioutil::{file_write_all, vec_extend_to_at_least},
+    node::TermId,
+    EntrySize, LogOffset,
+};
 
 #[derive(BinRead, BinWrite, Debug)]
 #[br(big)]
@@ -26,7 +33,7 @@ pub struct SegmentFileHeader {
     #[br(assert(version != 0))]
     pub version: u8,
 
-    /// The starting  log offset this segment file contains
+    /// The starting log offset this segment file contains
     pub log_offset: LogOffset,
 
     /// Magic byte, just to be able to detect it's different than 0
@@ -36,11 +43,12 @@ pub struct SegmentFileHeader {
 }
 
 impl SegmentFileHeader {
+    #[allow(unused)]
     pub const BYTE_SIZE: usize = 1 + 8 + 1;
     pub const BYTE_SIZE_U64: u64 = 1 + 8 + 1;
 }
 
-#[derive(BinRead, BinWrite, Debug)]
+#[derive(BinRead, BinWrite, Debug, Copy, Clone)]
 #[br(big)]
 #[bw(big)]
 pub struct EntryHeader {
@@ -58,32 +66,60 @@ impl EntryHeader {
 #[bw(big)]
 // Just something that we can detect at the end and make sure 0s turned into 1s
 pub struct EntryTrailer {
-    #[bw(magic = 0xffu8)]
-    #[br(magic = 0xffu8)]
-    pub ff: (),
+    // 0xff = valid
+    // 0x55 = entry invalid (e.g. client disconnected before fully uploading)
+    #[br(assert(marker == Self::ENTRY_INVALID || marker == Self::ENTRY_VALID))]
+    marker: u8,
 }
 
 impl EntryTrailer {
     pub const BYTE_SIZE: usize = 1;
+    pub const BYTE_SIZE_U64: u64 = 1;
+
+    pub const ENTRY_VALID: u8 = 0xff;
+    pub const ENTRY_INVALID: u8 = 0x55;
+
+    pub fn valid() -> Self {
+        Self {
+            marker: Self::ENTRY_VALID,
+        }
+    }
+
+    pub fn invalid() -> Self {
+        Self {
+            marker: Self::ENTRY_INVALID,
+        }
+    }
+
+    #[allow(unused)]
+    pub fn is_valid(self) -> Option<bool> {
+        match self.marker {
+            Self::ENTRY_VALID => Some(true),
+            Self::ENTRY_INVALID => Some(false),
+            _ => None,
+        }
+    }
 }
 
 /// Information about a segement
-pub struct Segment {
-    file_meta: SegmentFileMeta,
-    content_meta: SegmentContentMeta,
+#[derive(Clone, Debug)]
+pub struct SegmentMeta {
+    pub file_meta: SegmentFileMeta,
+    pub content_meta: SegmentContentMeta,
 }
 
 /// Segment metadata
 ///
 /// Basically everything we can figure out about segment file
 /// without opening it.
+#[derive(Clone, Debug)]
 pub struct SegmentFileMeta {
     // Segments are sequentially numbered and `id` used to create their name
-    id: u64,
+    pub id: u64,
     /// Id in a `String` version, to avoid redoing it
-    id_str: String,
+    pub id_str: String,
 
-    file_len: u64,
+    pub file_len: u64,
 }
 
 /// Data about segment content from the file content itself (mostly header)
@@ -92,9 +128,9 @@ pub struct SegmentContentMeta {
     /// The starting byte of the stream this segment holds.
     ///
     /// This data is stored in the file header.
-    start_stream_pos: LogOffset,
-    /// End of valid stream content stored in this segment
-    end_stream_pos: LogOffset,
+    pub start_log_offset: LogOffset,
+    /// End of valid log content stored in this segment (start + size)
+    pub end_log_offset: LogOffset,
 }
 
 #[derive(Error, Debug)]
@@ -109,12 +145,13 @@ pub enum ScanError {
     InvalidFilePath { path: PathBuf },
 }
 
+pub struct EntryWrite {
+    pub offset: LogOffset,
+    pub entry: Vec<u8>,
+}
 pub type ScanResult<T> = std::result::Result<T, ScanError>;
 
-pub struct LogStore {
-    /// Known segments, sorted by `stream_offset`
-    segments: Vec<Segment>,
-}
+pub struct LogStore;
 
 impl LogStore {
     /// Scan `db_path` and find all the files that look like segment files.
@@ -172,7 +209,7 @@ impl LogStore {
         Ok(segments)
     }
 
-    pub fn load_db(db_path: &Path) -> ScanResult<LogStore> {
+    pub fn load_db(db_path: &Path) -> ScanResult<Vec<SegmentMeta>> {
         let mut files_meta = Self::scan_db_path(db_path)?;
 
         files_meta.sort_by_key(|meta| meta.id);
@@ -184,7 +221,7 @@ impl LogStore {
             if let Some(content_meta) =
                 Self::open_and_recover(&file_meta, db_path.join(file_meta.file_name()))?
             {
-                segments.push(Segment {
+                segments.push(SegmentMeta {
                     file_meta,
                     content_meta,
                 });
@@ -200,40 +237,52 @@ impl LogStore {
             let first = segments.first().expect("no empty");
             let last = segments.last().expect("not empty");
             info!(
-                start_pos = first.content_meta.start_stream_pos.0,
+                start_pos = first.content_meta.start_log_offset.0,
                 start_segment = first.file_meta.id_str,
-                end_post = last.content_meta.end_stream_pos.0,
+                end_post = last.content_meta.end_log_offset.0,
                 end_segment = last.file_meta.id_str,
                 num_segments = segments.len(),
                 "Segments loaded"
             );
         }
 
-        Ok(Self { segments })
+        Ok(segments)
     }
 
     fn open_and_recover(
         file_meta: &SegmentFileMeta,
         path: std::path::PathBuf,
     ) -> io::Result<Option<SegmentContentMeta>> {
-        let file = std::fs::File::open(&path)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            // just in case we need to truncate
+            .write(true)
+            .open(&path)?;
         match SegmentContentMeta::read_from_file(file_meta, &file, &path)? {
-            Ok(o) => Ok(Some(o)),
+            Ok(o) => {
+                debug!(start_log_offset = o.start_log_offset.0, end_log_offset = o.end_log_offset.0, path = ?path.display(), "segment file cleanly opened");
+                Ok(Some(o))
+            }
             Err(SegmentParseError { r#type: type_, res }) => {
-                if let Some(content_meta) = res.0 {
+                if let Some(content_meta) = res.content_meta {
                     warn!(
                         path = ?path.display(),
                         error = ?type_,
+                        error_file_offset = res.error_offset,
                         from_size = file_meta.file_len,
-                        to_size = res.1,
-                        "removing segment file with no existing entries"
+                        to_size = res.truncate_size,
+                        "truncating segment file"
                     );
-                    ftruncate(file.as_raw_fd(), i64::try_from(res.1).expect("can't fail"))?;
+                    ftruncate(
+                        file.as_raw_fd(),
+                        i64::try_from(res.truncate_size).expect("can't fail"),
+                    )?;
                     Ok(Some(content_meta))
                 } else {
                     warn!(
                         path = ?path.display(),
                         error = ?type_,
+                        error_file_offset = res.error_offset,
                         "removing segment file with no existing entries"
                     );
                     std::fs::remove_file(path)?;
@@ -245,33 +294,74 @@ impl LogStore {
 }
 
 pub struct OpenSegment {
+    pub id: u64,
     pub file: File,
-    allocated_size: nix::libc::off_t,
+    pub allocated_size: u64,
     // The position in the stream of the first entry stored in this file
-    pub file_stream_start_pos: u64,
+    pub file_stream_start_pos: LogOffset,
 }
 
 impl OpenSegment {
-    pub async fn new(path: &Path, allocated_size: u64) -> io::Result<Self> {
-        let allocated_size = i64::try_from(allocated_size).expect("not fail");
+    pub async fn create_and_fallocate(
+        path: &Path,
+        id: u64,
+        allocated_size: u64,
+    ) -> io::Result<Self> {
         let file = OpenOptions::new()
-            .append(true)
+            .write(true)
             .create(true)
             .open(path)
             .await?;
 
+        // let buf = vec![0; allocated_size as usize];
+        // let (res, buf_res) = file_write_all(&file, buf.slice(..allocated_size as usize), 0).await;
+        // res.expect("Can't fail");
+
         let fd = file.as_raw_fd();
 
-        tokio::task::spawn_blocking(move || {
-            nix::fcntl::fallocate(fd, FallocateFlags::FALLOC_FL_ZERO_RANGE, 0, allocated_size)
+        tokio::task::spawn_blocking(move || -> nix::Result<()> {
+            nix::fcntl::fallocate(
+                fd,
+                FallocateFlags::FALLOC_FL_ZERO_RANGE,
+                0,
+                i64::try_from(allocated_size).expect("not fail"),
+            )?;
+            // let _ = nix::unistd::lseek(fd, 0, nix::unistd::Whence::SeekSet)?;
+            Ok(())
         })
         .await??;
 
         Ok(Self {
             file,
             allocated_size,
-            file_stream_start_pos: 0,
+            // temporarily, to be filled later
+            // I don't feel like creating a separate type for it RN
+            file_stream_start_pos: LogOffset(0),
+            id,
         })
+    }
+
+    pub async fn write_header(&self, log_offset: LogOffset, mut buf: Vec<u8>) -> Vec<u8> {
+        vec_extend_to_at_least(&mut buf, SegmentFileHeader::BYTE_SIZE);
+
+        let header = SegmentFileHeader {
+            version: 1,
+            log_offset,
+            ff_end: (),
+        };
+
+        header
+            .write_to(&mut Cursor::new(&mut buf))
+            .expect("can't fail");
+
+        let (res, res_buf) =
+            file_write_all(&self.file, buf.slice(..SegmentFileHeader::BYTE_SIZE), 0).await;
+
+        if let Err(e) = res {
+            panic!("IO Error when writting log: {}, crashing immediately", e);
+        }
+
+        res_buf
     }
 }
 
@@ -279,7 +369,7 @@ impl OpenSegment {
 
 #[derive(Error, Debug)]
 #[error("Segment parse error")]
-struct SegmentParseError<R> {
+pub struct SegmentParseError<R> {
     // content_meta: SegmentContentMeta,
     // /// Last valid file position
     // file_pos: u64,
@@ -291,7 +381,7 @@ struct SegmentParseError<R> {
 pub type SegmentParseResult<O, R> = std::result::Result<O, SegmentParseError<R>>;
 
 #[derive(Error, Debug)]
-enum SegmentParseErrorType {
+pub enum SegmentParseErrorType {
     #[error("io")]
     Io(#[from] io::Error),
     #[error("file truncated")]
@@ -313,13 +403,18 @@ impl SegmentParseErrorType {
 }
 
 impl SegmentFileMeta {
-    const FILE_SUFFIX: &'static str = ".seg.loglog";
+    pub const FILE_SUFFIX: &'static str = ".seg.loglog";
 
     fn file_name(&self) -> PathBuf {
         PathBuf::from(format!("{}{}", self.id_str, Self::FILE_SUFFIX))
     }
 }
 
+struct SegmentContentRecoveredInfo {
+    content_meta: Option<SegmentContentMeta>,
+    truncate_size: u64,
+    error_offset: u64,
+}
 impl SegmentContentMeta {
     /// Read the segment file trying to recover as much data as possible
     ///
@@ -332,11 +427,15 @@ impl SegmentContentMeta {
         file_meta: &SegmentFileMeta,
         file: &std::fs::File,
         path: &Path,
-    ) -> io::Result<SegmentParseResult<SegmentContentMeta, (Option<SegmentContentMeta>, u64)>> {
+    ) -> io::Result<SegmentParseResult<SegmentContentMeta, SegmentContentRecoveredInfo>> {
         if file_meta.file_len < SegmentFileHeader::BYTE_SIZE_U64 {
-            return Ok(Err(
-                SegmentParseErrorType::FileTruncated.into_error((None, file_meta.file_len))
-            ));
+            return Ok(Err(SegmentParseErrorType::FileTruncated.into_error(
+                SegmentContentRecoveredInfo {
+                    content_meta: None,
+                    truncate_size: 0,
+                    error_offset: file_meta.file_len,
+                },
+            )));
         }
         let mut reader = BufReader::new(file);
         let header = match SegmentFileHeader::read(&mut reader).map_err(|e| {
@@ -346,15 +445,19 @@ impl SegmentContentMeta {
             Ok(o) => o,
             Err(binrw::Error::Io(e)) => return Err(e),
             Err(e) => {
-                return Ok(Err(
-                    SegmentParseErrorType::InvalidFileHeader(e).into_error((None, 0))
-                ))
+                return Ok(Err(SegmentParseErrorType::InvalidFileHeader(e).into_error(
+                    SegmentContentRecoveredInfo {
+                        content_meta: None,
+                        truncate_size: 0,
+                        error_offset: file_meta.file_len,
+                    },
+                )))
             }
         };
 
-        let file_pos_start = SegmentFileHeader::BYTE_SIZE_U64;
-        let mut file_pos: u64 = file_pos_start;
-        let mut file_size_left = file_meta.file_len - file_pos_start;
+        let file_pos_log_data_start = SegmentFileHeader::BYTE_SIZE_U64;
+        let mut file_pos: u64 = file_pos_log_data_start;
+        let mut file_size_left = file_meta.file_len - file_pos_log_data_start;
 
         // TODO: we're going to need that `term` to valide against leader log
         while file_meta.file_len != file_pos {
@@ -366,49 +469,66 @@ impl SegmentContentMeta {
                 }
                 Err(SegmentParseError {
                     r#type,
-                    res: error_offset,
-                }) => match r#type {
-                    // We bubble up legitimate IO errors, instead of trying to truncate/delete possibly
-                    // correct files due to underlying IO issues.
-                    SegmentParseErrorType::Io(io)
-                    | SegmentParseErrorType::InvalidEntryHeader(binrw::Error::Io(io))
-                    | SegmentParseErrorType::FileSeekFailed(io)
-                    | SegmentParseErrorType::InvalidEntryTrailer(binrw::Error::Io(io)) => {
-                        return Err(io);
+                    res: error_file_offset,
+                }) => {
+                    let res = SegmentContentRecoveredInfo {
+                        content_meta: if file_pos != file_pos_log_data_start {
+                            Some(SegmentContentMeta {
+                                start_log_offset: header.log_offset,
+                                end_log_offset: LogOffset(
+                                    header.log_offset.0 + file_pos - file_pos_log_data_start,
+                                ),
+                            })
+                        } else {
+                            None
+                        },
+                        truncate_size: file_pos,
+                        error_offset: u64::try_from(error_file_offset).expect("must not fail"),
+                    };
+
+                    match r#type {
+                        // We bubble up legitimate IO errors, instead of trying to truncate/delete possibly
+                        // correct files due to underlying IO issues.
+                        SegmentParseErrorType::Io(io)
+                        | SegmentParseErrorType::InvalidEntryHeader(binrw::Error::Io(io))
+                        | SegmentParseErrorType::FileSeekFailed(io)
+                        | SegmentParseErrorType::InvalidEntryTrailer(binrw::Error::Io(io)) => {
+                            return Err(io);
+                        }
+                        e @ SegmentParseErrorType::InvalidEntryHeader(_) => {
+                            // warn!(
+                            //     "Invalid header at file offset {}: {} ",
+                            //     file_pos + u64::try_from(error_offset).expect("can't fail"),
+                            //     e
+                            // );
+                            return Ok(Err(e.into_error(res)));
+                        }
+                        e @ SegmentParseErrorType::InvalidEntryTrailer(_) => {
+                            // warn!(
+                            //     "Failed payload seek at file offset {}: {} ",
+                            //     file_pos + u64::try_from(error_offset).expect("can't fail"),
+                            //     e
+                            // );
+                            return Ok(Err(e.into_error(res)));
+                        }
+                        e @ SegmentParseErrorType::FileTruncated => {
+                            // warn!(
+                            //     "File truncated at file offset: {}",
+                            //     file_pos + u64::try_from(error_offset).expect("can't fail"),
+                            // );
+                            return Ok(Err(e.into_error(res)));
+                        }
+                        SegmentParseErrorType::InvalidFileHeader(_) => {
+                            panic!("parsing entry should not return this error")
+                        }
                     }
-                    SegmentParseErrorType::InvalidEntryHeader(e) => {
-                        warn!(
-                            "Invalid header at file offset {}: {} ",
-                            file_pos + u64::try_from(error_offset).expect("can't fail"),
-                            e
-                        );
-                        break;
-                    }
-                    SegmentParseErrorType::InvalidEntryTrailer(e) => {
-                        warn!(
-                            "Failed payload seek at file offset {}: {} ",
-                            file_pos + u64::try_from(error_offset).expect("can't fail"),
-                            e
-                        );
-                        break;
-                    }
-                    SegmentParseErrorType::FileTruncated => {
-                        warn!(
-                            "File truncated at file offset: {}",
-                            file_pos + u64::try_from(error_offset).expect("can't fail"),
-                        );
-                        break;
-                    }
-                    SegmentParseErrorType::InvalidFileHeader(_) => {
-                        panic!("parsing entry should not return this error")
-                    }
-                },
+                }
             }
         }
 
         Ok(Ok(SegmentContentMeta {
-            start_stream_pos: header.log_offset,
-            end_stream_pos: LogOffset(header.log_offset.0 + file_pos - file_pos_start),
+            start_log_offset: header.log_offset,
+            end_log_offset: LogOffset(header.log_offset.0 + file_pos - file_pos_log_data_start),
         }))
     }
 
@@ -426,6 +546,8 @@ impl SegmentContentMeta {
         let header = EntryHeader::read(reader)
             .map_err(SegmentParseErrorType::InvalidEntryHeader)
             .map_err(|e| e.into_error(0))?;
+
+        debug!(header = ?header, file_size_left, "read entry header");
 
         let entry_size = EntryHeader::BYTE_SIZE
             + usize::try_from(header.payload_size.0).expect("can't fail")
