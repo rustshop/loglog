@@ -21,7 +21,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing = "0.1.35"
 clap = { version = "3.1.6", features = [ "derive", "env" ] }
 error-stack = "0.1.1"
-tokio = { version = "1.19.2", features = ["macros", "rt", "rt-multi-thread", "signal", "io-util", "net", "sync"] }
+tokio = { version = "1.19.2", features = ["macros", "rt", "rt-multi-thread", "signal", "io-util", "net", "sync", "time"] }
 thiserror = "1.0.31"
 num_enum = "0.5.7"
 nix = "0.24.2"

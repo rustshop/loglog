@@ -122,6 +122,15 @@ pub struct SegmentFileMeta {
     pub file_len: u64,
 }
 
+impl SegmentFileMeta {
+    pub fn new(id: u64, file_len: u64) -> Self {
+        Self {
+            id,
+            id_str: format!("{:#016}", id),
+            file_len,
+        }
+    }
+}
 /// Data about segment content from the file content itself (mostly header)
 #[derive(Debug, Copy, Clone)]
 pub struct SegmentContentMeta {
@@ -298,7 +307,7 @@ pub struct OpenSegment {
     pub file: File,
     pub allocated_size: u64,
     // The position in the stream of the first entry stored in this file
-    pub file_stream_start_pos: LogOffset,
+    // pub start_log_offset: LogOffset,
 }
 
 impl OpenSegment {
@@ -332,12 +341,12 @@ impl OpenSegment {
         .await??;
 
         Ok(Self {
+            id,
             file,
             allocated_size,
             // temporarily, to be filled later
             // I don't feel like creating a separate type for it RN
-            file_stream_start_pos: LogOffset(0),
-            id,
+            // start_log_offset: LogOffset(0),
         })
     }
 

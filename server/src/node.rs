@@ -1,10 +1,12 @@
 use binrw::{BinRead, BinWrite};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Cursor};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{Mutex, RwLock};
+use tokio::time::sleep;
 use tokio_uring::buf::IoBuf;
 use tokio_uring::net::TcpStream;
 use tracing::{debug, trace, warn};
@@ -53,7 +55,7 @@ pub struct OpenSegments {
     ///
     /// The outter lock is only for adding/removing elements
     /// from this vector, and `future_rx`.
-    inner: Vec<Arc<OpenSegment>>,
+    inner: BTreeMap<LogOffset, Arc<OpenSegment>>,
     /// Segment pre-writing thread will keep sending us new threads through this
     future_rx: Receiver<OpenSegment>,
 }
@@ -104,7 +106,7 @@ impl Node {
             }),
             sealed_segments: RwLock::new(sealed_segments),
             open_segments: RwLock::new(OpenSegments {
-                inner: vec![],
+                inner: BTreeMap::new(),
                 future_rx: future_segments,
             }),
             entry_writer_tx,
@@ -168,11 +170,10 @@ impl Node {
             "Received new entry write"
         );
 
-        let segment = self.get_segment_for(offset).await;
+        let (segment_start_log_offset, segment) = self.get_segment_for_write(offset).await;
 
         // TODO: check if we didn't already have this chunk, and if the offset seems valid (keep track in memory)
-        let file_offset =
-            offset.0 - segment.file_stream_start_pos.0 + SegmentFileHeader::BYTE_SIZE_U64;
+        let file_offset = offset.0 - segment_start_log_offset.0 + SegmentFileHeader::BYTE_SIZE_U64;
 
         debug!(
             offset = offset.0,
@@ -195,92 +196,137 @@ impl Node {
         self.put_entry_buffer(res_buf).await;
     }
 
-    async fn get_segment_for<'a>(self: &'a Arc<Self>, log_offset: LogOffset) -> Arc<OpenSegment> {
-        fn find_index_for_offset(
-            open_segments: &Vec<Arc<OpenSegment>>,
+    async fn get_segment_for_write<'a>(
+        self: &'a Arc<Self>,
+        entry_log_offset: LogOffset,
+    ) -> (LogOffset, Arc<OpenSegment>) {
+        fn get_segment_for_offset(
+            open_segments: &BTreeMap<LogOffset, Arc<OpenSegment>>,
             log_offset: LogOffset,
-        ) -> Option<usize> {
-            let index = match open_segments
-                .binary_search_by_key(&log_offset, |segment| segment.file_stream_start_pos)
-            {
-                Ok(i) => i,
-                Err(i) => i,
-            };
+        ) -> Option<(LogOffset, Arc<OpenSegment>)> {
+            let mut iter = open_segments.range(..log_offset);
 
-            // It's one of the not-last ones
-            if index < open_segments.len() {
-                return Some(index);
+            if let Some(segment) = iter.next_back() {
+                // It's one of the not-last ones, we can return right away
+                if segment.0
+                    != open_segments
+                        .last_key_value()
+                        .expect("has at least one element")
+                        .0
+                {
+                    return Some((*segment.0, segment.1.clone()));
+                }
             }
-            assert_eq!(index, open_segments.len());
 
             // It's the last one or we need a new one
-            if let Some(last) = open_segments.last() {
-                debug_assert!(last.file_stream_start_pos < log_offset);
-                let write_offset = log_offset.0 - last.file_stream_start_pos.0;
+            if let Some((last_start_log_offset, last)) = open_segments.last_key_value() {
+                debug_assert!(*last_start_log_offset <= log_offset);
+                let write_offset = log_offset.0 - last_start_log_offset.0;
                 if write_offset + SegmentFileHeader::BYTE_SIZE_U64 < last.allocated_size {
-                    return Some(open_segments.len() - 1);
+                    return Some((*last_start_log_offset, last.clone()));
                 }
             }
             None
         }
 
-        // Usually the segment to use should be one of the existing one,
-        // so lock the list for reading and clone the match if so.
-        let read_open_segments = self.open_segments.read().await;
-
-        if let Some(idx) = find_index_for_offset(&read_open_segments.inner, log_offset) {
-            return read_open_segments.inner[idx].clone();
+        #[derive(Copy, Clone)]
+        struct LastSegmentInfo {
+            start_log_offset: LogOffset,
+            end_of_allocation_log_offset: LogOffset,
         }
-        let last_segment_pos = read_open_segments
-            .inner
-            .last()
-            .map(|s| s.file_stream_start_pos);
-        drop(read_open_segments);
 
-        // It wasn't one of the existing open segments, so we drop the lock fo reading
-        // so potentially other threads can make write their stuff, and try to switch
-        // to writes.
-        let mut write_open_segments = self.open_segments.write().await;
+        loop {
+            let last_segment_info = {
+                // Usually the segment to use should be one of the existing one,
+                // so lock the list for reading and clone the match if so.
+                let read_open_segments = self.open_segments.read().await;
 
-        // Check again if still needed (things might have changed between unlock & write lock)
+                if let Some(segment) =
+                    get_segment_for_offset(&read_open_segments.inner, entry_log_offset)
+                {
+                    return segment;
+                }
+                // Well.. seems like we need a new one... . Record the ending offset
+                let last_segment_info =
+                    read_open_segments
+                        .inner
+                        .last_key_value()
+                        .map(|s| LastSegmentInfo {
+                            start_log_offset: *s.0,
+                            end_of_allocation_log_offset: LogOffset(s.0 .0 + s.1.allocated_size),
+                        });
+                drop(read_open_segments);
+                last_segment_info
+            };
 
-        if write_open_segments
-            .inner
-            .last()
-            .map(|s| s.file_stream_start_pos)
-            != last_segment_pos
-        {
-            // Some other thread(s) must have appened new open segment(s) - we can just use it
-
-            if let Some(idx) = find_index_for_offset(&write_open_segments.inner, log_offset) {
-                return write_open_segments.inner[idx].clone();
+            let next_segment_start_log_offset = if let Some(last_segment_info) = last_segment_info {
+                // TODO: make `entries_in_flight` their own type, and make a method on that type
+                // It would be a mistake to consider current `entry_log_offset` as a beginning of
+                // next segment as we might have arrived here out of order. Instead - we can use
+                // `unwritten` to find first
+                *self
+                    .entries_in_flight
+                    .read()
+                    .await
+                    .unwritten
+                    .range(last_segment_info.end_of_allocation_log_offset..)
+                    .next()
+                    .expect("at very least this entry should be in `unwritten`")
             } else {
-                panic!("Expected to see forward progress");
-            }
+                self.sealed_segments
+                    .read()
+                    .await
+                    .last()
+                    .map(|last_sealed_segment| last_sealed_segment.content_meta.end_log_offset)
+                    .unwrap_or(LogOffset(0))
+            };
+
+            // It wasn't one of the existing open segments, so we drop the lock fo reading
+            // so potentially other threads can make write their stuff, and try to switch
+            // to writes.
+            let new_segment = {
+                let mut write_open_segments = self.open_segments.write().await;
+
+                // Check again if we still need to create new open segment. Things might have changed between unlock & write lock - some
+                // other thread might have done it before us. In such a case the last_segment we recorded, will be different now.
+                if write_open_segments.inner.last_key_value().map(|s| *s.0)
+                    != last_segment_info.map(|s| s.start_log_offset)
+                {
+                    // Some other thread(s) must have appened new open segment(s) - we can posibly just use it
+                    //  but we need to check again.
+                    continue;
+                }
+
+                // Receive a new pre-written segment from pre-writer
+                let new_segment = Arc::new(
+                    write_open_segments
+                        .future_rx
+                        .recv()
+                        .await
+                        .expect("segment pre-writing thread must never disconnect"),
+                );
+                let prev = write_open_segments
+                    .inner
+                    .insert(next_segment_start_log_offset, new_segment.clone());
+                debug_assert!(prev.is_none());
+                // we can drop the write lock already, since the segment is already usable
+                // However, we are still responsible for writing the segment file header,
+                // which pre-writer couldn't do, as it didn't know the starting log offset
+                drop(write_open_segments);
+                new_segment
+            };
+
+            self.put_entry_buffer(
+                new_segment
+                    .write_header(entry_log_offset, self.pop_entry_buffer().await)
+                    .await,
+            )
+            .await;
+
+            // It would be tempting to just return the `new_segment` as the segment we need. But that would be
+            // a mistake - this entry might theoretically be so far ahead, that it needs even more segments opened.
+            // Because of this we just let the loop run again.
         }
-
-        // Receive a new pre-written segment from pre-writer
-        let mut new_segment = write_open_segments
-            .future_rx
-            .recv()
-            .await
-            .expect("segment pre-writing thread must never disconnect");
-        new_segment.file_stream_start_pos = log_offset;
-        let new_segment = Arc::new(new_segment);
-        write_open_segments.inner.push(new_segment.clone());
-        // we can drop the write lock already, since the segment is already usable
-        // However, we are still responsible for writing the segment file header,
-        // which pre-writer couldn't do, as it didn't know the starting log offset
-        drop(write_open_segments);
-
-        self.put_entry_buffer(
-            new_segment
-                .write_header(log_offset, self.pop_entry_buffer().await)
-                .await,
-        )
-        .await;
-
-        new_segment
     }
 
     pub async fn mark_entry_written(self: &Arc<Node>, log_offset: LogOffset) {
@@ -507,5 +553,103 @@ impl Node {
             .await;
 
         read_res
+    }
+    pub async fn get_first_unwritten_log_offset(self: &Arc<Self>) -> LogOffset {
+        let read_in_flight = self.entries_in_flight.read().await;
+        read_in_flight
+            .unwritten
+            .iter()
+            .next()
+            .copied()
+            .unwrap_or(read_in_flight.next_available_log_offset)
+    }
+
+    pub async fn run_fsync_loop(self: Arc<Self>) {
+        let mut last_fsync = Instant::now();
+        let mut last_fsynced_log_offset = LogOffset(0);
+        loop {
+            let now = Instant::now();
+            let till_next_fsync =
+                Duration::from_millis(300).saturating_sub(now.duration_since(last_fsync));
+
+            sleep(till_next_fsync).await;
+            last_fsync = Instant::now();
+
+            let first_unwritten_log_offset = self.get_first_unwritten_log_offset().await;
+
+            if last_fsynced_log_offset == first_unwritten_log_offset {
+                continue;
+            }
+
+            'inner: loop {
+                let read_open_segments = self.open_segments.read().await;
+
+                let mut segments_iter = read_open_segments.inner.iter();
+                let first_segment = segments_iter.next().clone();
+                let second_segment_start = segments_iter.next().map(|s| s.0).cloned();
+                drop(segments_iter);
+
+                if let Some((first_segment_start_log_offset, first_segment)) = first_segment {
+                    debug!(
+                        segment_id = first_segment.id,
+                        segment_start_log_offset = first_segment_start_log_offset.0,
+                        first_unwritten_log_offset = first_unwritten_log_offset.0,
+                        "fsync"
+                    );
+                    if let Err(e) = first_segment.file.sync_data().await {
+                        warn!(error = %e, "Could not fsync opened segment file");
+                        break 'inner;
+                    }
+
+                    let first_segment_end_log_offset = match second_segment_start {
+                        Some(v) => v,
+                        // Until we have at lest two open segments, we won't close the first one.
+                        // It's not a big deal, and avoids having to calculate the end of first
+                        // segment.
+                        None => break 'inner,
+                    };
+
+                    // Are all the pending writes to the first open segment complete? If so,
+                    // we can close and seal it.
+                    if first_segment_end_log_offset <= first_unwritten_log_offset {
+                        let first_segment_offset_size =
+                            first_segment_end_log_offset.0 - first_segment_start_log_offset.0;
+                        // Note: we append to sealed segments first, and remove from open segments second. This way
+                        // any readers looking for their data can't miss it between removal and addition.
+                        {
+                            let mut write_sealed_segments = self.sealed_segments.write().await;
+                            write_sealed_segments.push(SegmentMeta {
+                                file_meta: SegmentFileMeta::new(
+                                    first_segment.id,
+                                    first_segment_offset_size + SegmentFileHeader::BYTE_SIZE_U64,
+                                ),
+                                content_meta: segment::SegmentContentMeta {
+                                    start_log_offset: *first_segment_start_log_offset,
+                                    end_log_offset: first_segment_end_log_offset,
+                                },
+                            });
+                            drop(write_sealed_segments);
+                        }
+                        {
+                            let mut write_open_segments = self.open_segments.write().await;
+                            let removed = write_open_segments
+                                .inner
+                                .remove(first_segment_start_log_offset);
+                            debug_assert!(removed.is_some());
+                        }
+                    } else {
+                        break 'inner;
+                    }
+
+                    // continue 'inner - there might be more
+                } else {
+                    break 'inner;
+                }
+            }
+
+            // Only after successfully looping and fsyncing and/or closing all matching segments
+            // we update `last_fsynced_log_offset`
+            last_fsynced_log_offset = first_unwritten_log_offset;
+        }
     }
 }

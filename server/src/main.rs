@@ -1,5 +1,6 @@
+#![feature(map_first_last)]
 use binrw::{BinRead, BinWrite, ReadOptions, WriteOptions};
-use derive_more::Sub;
+use derive_more::{Add, Sub};
 use node::{Parameters, TermId};
 use num_enum::FromPrimitive;
 use opts::Opts;
@@ -44,7 +45,7 @@ macro_rules! uring_try_rec {
 ///
 /// Notably LogLog for performance reasons includes each entry's
 /// header and trailer the log, but segment file header is not included.
-#[derive(Copy, Clone, Debug, BinRead, BinWrite, PartialEq, Eq, PartialOrd, Ord, Sub)]
+#[derive(Copy, Clone, Debug, BinRead, BinWrite, PartialEq, Eq, PartialOrd, Ord, Sub, Add)]
 #[br(big)]
 #[bw(big)]
 pub struct LogOffset(u64);
@@ -119,12 +120,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?);
 
     tokio_uring::start(async {
+        // TODO: move these into `impl Node` somewhere?
         tokio_uring::spawn(node.clone().run_entry_write_loop(_entry_write_rx));
         tokio_uring::spawn(
             node.clone()
                 .run_segment_preloading_loop(next_segment_id, _future_segments_tx),
         );
 
+        tokio_uring::spawn(node.clone().run_fsync_loop());
         let listener = TcpListener::bind(opts.listen)?;
         info!("Listening on: {}", opts.listen);
 
