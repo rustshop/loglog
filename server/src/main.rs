@@ -1,23 +1,20 @@
 use binrw::{BinRead, BinWrite, ReadOptions, WriteOptions};
 use derive_more::Sub;
-use ioutil::{tcpstream_write_all, vec_extend_to_at_least};
 use node::{Parameters, TermId};
 use num_enum::FromPrimitive;
 use opts::Opts;
 use std::error::Error;
-use std::io;
-use std::io::{Cursor, Read, Seek};
+use std::io::{self};
+use std::io::{Read, Seek};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc::channel;
-use tokio_uring::buf::IoBuf;
-use tokio_uring::net::{TcpListener, TcpStream};
-use tracing::{debug, info, warn};
+use tokio_uring::net::TcpListener;
+use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::ioutil::tcpstream_read_fill;
 use crate::node::Node;
-use crate::segment::{EntryHeader, EntryTrailer, EntryWrite, LogStore};
+use crate::segment::LogStore;
 
 mod ioutil;
 mod node;
@@ -25,6 +22,7 @@ mod opts;
 mod segment;
 
 /// A `?`-like macro to call functions that return values in `(res, buf)` uring-convention
+#[macro_export]
 macro_rules! uring_try_rec {
     ($buf:ident, $e:expr) => {{
         let (res, res_buf) = $e;
@@ -38,20 +36,6 @@ macro_rules! uring_try_rec {
         }
     }};
 }
-
-/// A `?`-like macro to call functions that return a normal `Result`, when called from `(res, buf)`-returning uring-convention
-// macro_rules! uring_try {
-//     ($buf:ident, $e:expr) => {{
-//         let res = $e;
-
-//         match res {
-//             Err(e) => {
-//                 return (Err(e.into()), $buf);
-//             }
-//             Ok(o) => o,
-//         }
-//     }};
-// }
 
 /// Logical offset in an the binary log stream
 ///
@@ -88,6 +72,7 @@ impl AllocationId {
 
 #[test]
 fn allocation_id_serde() {
+    use std::io::Cursor;
     let v = AllocationId {
         term: TermId(0x0123),
         offset: LogOffset(0x456789abcdef0011),
@@ -149,7 +134,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             tokio_uring::spawn({
                 let node = node.clone();
                 async move {
-                    if let Err(e) = handle_connection(&node, &mut stream).await {
+                    if let Err(e) = node.handle_connection(&mut stream).await {
                         info!("Connection error: {}", e);
                     }
                 }
@@ -241,187 +226,4 @@ pub fn read_entry_size(buf: &[u8]) -> ConnectionResult<usize> {
     }
 
     Ok(usize::try_from(res).expect("will not work on 16bit machines"))
-}
-
-/// Handle connection
-async fn handle_connection(node: &Arc<Node>, stream: &mut TcpStream) -> ConnectionResult<()> {
-    // Header breakdown:
-    // * 1B - cmd + basic args
-    // * if Append
-    //   * 3B event size
-    // * if Fill:
-    //   * 3B size
-    //   * 10B allocation id
-    // * if Read:
-    //   * 8B - stream offset
-    // * if Peer commands
-    //   * TBD: something else, but short
-    //
-    // Max: 14B of constant header, so we can read constant header once
-    // and move straight to action.
-    // let mut header_buf = [0u8; 14];
-
-    // TODO: add timeouts?
-    loop {
-        let mut buf = node.pop_entry_buffer().await;
-        vec_extend_to_at_least(&mut buf, 14);
-
-        let (res, res_buf) = tcpstream_read_fill(stream, buf.slice(0..14)).await;
-
-        if res.is_err() {
-            node.put_entry_buffer(res_buf).await;
-            return res;
-        } else {
-            buf = res_buf;
-        }
-
-        let cursor = &mut Cursor::new(&buf[..14]);
-        let cmd = match HeaderCmd::read(cursor) {
-            Ok(cmd) => cmd,
-            Err(e) => {
-                node.put_entry_buffer(buf).await;
-                return Err(e.into());
-            }
-        };
-
-        match cmd {
-            HeaderCmd::Peer => {
-                todo!();
-            }
-            HeaderCmd::Append => {
-                let args = match StreamHeaderAppend::read(cursor) {
-                    Ok(args) => args,
-                    Err(e) => {
-                        node.put_entry_buffer(buf).await;
-                        return Err(e.into());
-                    }
-                };
-                debug!(cmd = ?cmd, args = ?args);
-
-                handle_append(node, stream, buf, args.size).await?;
-            }
-            HeaderCmd::Fill => {
-                let args = match StreamHeaderFill::read(cursor) {
-                    Ok(args) => args,
-                    Err(e) => {
-                        node.put_entry_buffer(buf).await;
-                        return Err(e.into());
-                    }
-                };
-                debug!(cmd = ?cmd, args = ?args);
-
-                handle_fill(node, stream, buf, args.allocation_id, args.size).await?;
-            }
-            HeaderCmd::Read => {
-                todo!();
-            }
-            HeaderCmd::Other => Err(ConnectionError::Invalid)?,
-        }
-    }
-}
-
-async fn handle_append(
-    node: &Arc<Node>,
-    stream: &mut TcpStream,
-    buf: Vec<u8>,
-    entry_size: EntrySize,
-) -> ConnectionResult<()> {
-    let allocation_id = node.allocate_new_entry(entry_size).await;
-
-    // TODO: send the allocation id right away, in parallel, flush it, so the client can
-    // start uploading to other nodes right away
-
-    handle_fill(node, stream, buf, allocation_id, entry_size).await?;
-
-    debug!("Sending response to append request");
-    let mut resp_buf = node.pop_entry_buffer().await;
-    // 0-byte == 0 -> success
-    let res_size = 1 + AllocationId::BYTE_SIZE;
-    vec_extend_to_at_least(&mut resp_buf, res_size);
-
-    resp_buf[1..res_size].copy_from_slice(&allocation_id.to_bytes());
-
-    let (res, res_buf) = tcpstream_write_all(stream, resp_buf.slice(..res_size)).await;
-
-    node.put_entry_buffer(res_buf).await;
-
-    res
-}
-
-async fn read_payload(
-    stream: &mut TcpStream,
-    mut entry_buf: Vec<u8>,
-    payload_size: EntrySize,
-) -> RingConnectionResult<()> {
-    let entry_header_size = EntryHeader::BYTE_SIZE;
-
-    debug!(size = payload_size.0, "Reading payload");
-    uring_try_rec!(
-        entry_buf,
-        tcpstream_read_fill(
-            stream,
-            entry_buf.slice(
-                entry_header_size
-                    ..(entry_header_size + usize::try_from(payload_size.0).expect("can't fail"))
-            )
-        )
-        .await
-    );
-
-    (Ok(()), entry_buf)
-}
-
-async fn handle_fill(
-    node: &Arc<Node>,
-    stream: &mut TcpStream,
-    mut buf: Vec<u8>,
-    allocation_id: AllocationId,
-    payload_size: EntrySize,
-) -> ConnectionResult<()> {
-    let entry_header_size = EntryHeader::BYTE_SIZE;
-    let entry_trailer_size = EntryTrailer::BYTE_SIZE;
-    // TODO: allocation_id.term vs node.term
-    let header = segment::EntryHeader {
-        term: allocation_id.term,
-        payload_size,
-    };
-
-    let total_entry_size =
-        entry_header_size + usize::try_from(payload_size.0).expect("not fail") + entry_trailer_size;
-    vec_extend_to_at_least(&mut buf, total_entry_size);
-
-    header
-        .write_to(&mut Cursor::new(&mut buf[0..entry_header_size]))
-        .expect("Can't fail");
-
-    let (read_res, res_buf) = read_payload(stream, buf, payload_size).await;
-    buf = res_buf;
-
-    let trailer = match &read_res {
-        Ok(()) => EntryTrailer::valid(),
-        Err(e) => {
-            warn!("Failed to read payload from client: {}", e);
-            EntryTrailer::invalid()
-        }
-    };
-
-    trailer
-        .write_to(&mut Cursor::new(
-            &mut buf[total_entry_size - entry_trailer_size..total_entry_size],
-        ))
-        .expect("Can't fail");
-
-    buf.truncate(total_entry_size);
-
-    // The other side should never be disconnected, but if it is,
-    // we just move on without complaining.
-    let _ = node
-        .entry_writer_tx
-        .send(EntryWrite {
-            offset: allocation_id.offset,
-            entry: buf,
-        })
-        .await;
-
-    read_res
 }
