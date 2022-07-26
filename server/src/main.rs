@@ -51,6 +51,10 @@ macro_rules! uring_try_rec {
 pub struct LogOffset(u64);
 
 /// External ID of the allocated event buffer
+///
+/// It coins `TermId`, so that clients "Filling"
+/// data at offsets in non-leader node can be rejected
+/// if the current leader of the node doesn't match.
 #[derive(Copy, Clone, BinRead, Debug, PartialEq, Eq)]
 pub struct AllocationId {
     pub term: TermId,
@@ -187,14 +191,20 @@ impl EntrySize {
 }
 
 #[derive(BinRead, Debug)]
-pub struct StreamHeaderAppend {
+pub struct AppendRequestHeader {
     size: EntrySize,
 }
 
 #[derive(BinRead, Debug)]
-pub struct StreamHeaderFill {
+pub struct FillRequestHeader {
     size: EntrySize,
     allocation_id: AllocationId,
+}
+
+#[derive(BinRead, Debug)]
+pub struct ReadRequestHeader {
+    offset: LogOffset,
+    limit: u32,
 }
 
 #[derive(Error, Debug)]
@@ -212,21 +222,3 @@ pub enum ConnectionError {
 pub type RingConnectionResult<T> = (ConnectionResult<T>, Vec<u8>);
 
 pub type ConnectionResult<T> = std::result::Result<T, ConnectionError>;
-
-/// Read a 3-byte size from buffer
-///
-/// ```
-/// assert_eq!(read_entry_size(&[0x11, 0xbb, 0xcc]), Ok(0x11_bb_cc));
-/// aseert_eq!(read_entry_size(&[0xaa, 0xbb, 0xcc]), Err(ConnectionError::Invalid));
-/// ```
-pub fn read_entry_size(buf: &[u8]) -> ConnectionResult<usize> {
-    assert!(buf.len() == 3);
-
-    let res: u32 = u32::from(buf[0]) << 16 | u32::from(buf[1]) << 8 | u32::from(buf[2]);
-
-    if 0x7f_ff_ff < res {
-        Err(ConnectionError::Invalid)?;
-    }
-
-    Ok(usize::try_from(res).expect("will not work on 16bit machines"))
-}

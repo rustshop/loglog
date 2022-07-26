@@ -2,6 +2,8 @@ use binrw::{BinRead, BinWrite};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Cursor};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::SeqCst;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -20,8 +22,8 @@ use crate::segment::{
     SegmentMeta,
 };
 use crate::{
-    uring_try_rec, AllocationId, ConnectionError, ConnectionResult, EntrySize, HeaderCmd,
-    LogOffset, RingConnectionResult, StreamHeaderAppend, StreamHeaderFill,
+    uring_try_rec, AllocationId, AppendRequestHeader, ConnectionError, ConnectionResult, EntrySize,
+    FillRequestHeader, HeaderCmd, LogOffset, ReadRequestHeader, RingConnectionResult,
 };
 
 #[derive(Copy, Clone, Debug, BinRead, PartialEq, Eq)]
@@ -73,7 +75,7 @@ pub struct Node {
     #[allow(unused)]
     id: NodeId,
     pub term: TermId,
-    // TODO: split into buckets by size
+    // TODO: split into buckets by size?
     entry_buffer_pool: Mutex<Vec<Vec<u8>>>,
 
     entries_in_flight: RwLock<EntriesInFlight>,
@@ -83,6 +85,8 @@ pub struct Node {
     /// Known segments, sorted by `stream_offset`
     sealed_segments: RwLock<Vec<SegmentMeta>>,
     pub entry_writer_tx: Sender<EntryWrite>,
+
+    fsynced_log_offset: AtomicU64,
 }
 
 impl Node {
@@ -110,6 +114,7 @@ impl Node {
                 future_rx: future_segments,
             }),
             entry_writer_tx,
+            fsynced_log_offset: AtomicU64::new(0),
         })
     }
 
@@ -264,20 +269,14 @@ impl Node {
                 // It would be a mistake to consider current `entry_log_offset` as a beginning of
                 // next segment as we might have arrived here out of order. Instead - we can use
                 // `unwritten` to find first
-                *self
-                    .entries_in_flight
-                    .read()
-                    .await
-                    .unwritten
-                    .range(last_segment_info.end_of_allocation_log_offset..)
-                    .next()
-                    .expect("at very least this entry should be in `unwritten`")
+                self.get_first_unwritten_entry_offset_ge(
+                    last_segment_info.end_of_allocation_log_offset,
+                )
+                .await
+                .expect("at very least this entry should be in `unwritten`")
             } else {
-                self.sealed_segments
-                    .read()
+                self.get_sealed_segments_end_log_offset()
                     .await
-                    .last()
-                    .map(|last_sealed_segment| last_sealed_segment.content_meta.end_log_offset)
                     .unwrap_or(LogOffset(0))
             };
 
@@ -414,7 +413,7 @@ impl Node {
                     todo!();
                 }
                 HeaderCmd::Append => {
-                    let args = match StreamHeaderAppend::read(cursor) {
+                    let args = match AppendRequestHeader::read(cursor) {
                         Ok(args) => args,
                         Err(e) => {
                             self.put_entry_buffer(buf).await;
@@ -423,10 +422,10 @@ impl Node {
                     };
                     debug!(cmd = ?cmd, args = ?args);
 
-                    self.handle_append(stream, buf, args.size).await?;
+                    self.handle_append_request(stream, buf, args.size).await?;
                 }
                 HeaderCmd::Fill => {
-                    let args = match StreamHeaderFill::read(cursor) {
+                    let args = match FillRequestHeader::read(cursor) {
                         Ok(args) => args,
                         Err(e) => {
                             self.put_entry_buffer(buf).await;
@@ -435,18 +434,28 @@ impl Node {
                     };
                     debug!(cmd = ?cmd, args = ?args);
 
-                    self.handle_fill(stream, buf, args.allocation_id, args.size)
+                    self.handle_fill_request(stream, buf, args.allocation_id, args.size)
                         .await?;
                 }
                 HeaderCmd::Read => {
-                    todo!();
+                    let args = match ReadRequestHeader::read(cursor) {
+                        Ok(args) => args,
+                        Err(e) => {
+                            self.put_entry_buffer(buf).await;
+                            return Err(e.into());
+                        }
+                    };
+                    debug!(cmd = ?cmd, args = ?args);
+
+                    self.handle_read_request(stream, args.offset, args.limit)
+                        .await?;
                 }
                 HeaderCmd::Other => Err(ConnectionError::Invalid)?,
             }
         }
     }
 
-    async fn handle_append(
+    async fn handle_append_request(
         self: &Arc<Node>,
         stream: &mut TcpStream,
         buf: Vec<u8>,
@@ -455,9 +464,9 @@ impl Node {
         let allocation_id = self.allocate_new_entry(entry_size).await;
 
         // TODO: send the allocation id right away, in parallel, flush it, so the client can
-        // start uploading to other nodes right away
+        // start uploading to other nodes immediately
 
-        self.handle_fill(stream, buf, allocation_id, entry_size)
+        self.handle_fill_request(stream, buf, allocation_id, entry_size)
             .await?;
 
         debug!("Sending response to append request");
@@ -475,7 +484,7 @@ impl Node {
         res
     }
 
-    async fn handle_fill(
+    async fn handle_fill_request(
         self: &Arc<Node>,
         stream: &mut TcpStream,
         mut buf: Vec<u8>,
@@ -554,6 +563,18 @@ impl Node {
 
         read_res
     }
+
+    async fn handle_read_request(
+        self: &Arc<Node>,
+        stream: &mut TcpStream,
+        log_offset: LogOffset,
+        limit: u32,
+    ) -> ConnectionResult<()> {
+        let read_sealed_segments = self.sealed_segments.read().await;
+
+        todo!();
+    }
+
     pub async fn get_first_unwritten_log_offset(self: &Arc<Self>) -> LogOffset {
         let read_in_flight = self.entries_in_flight.read().await;
         read_in_flight
@@ -564,9 +585,29 @@ impl Node {
             .unwrap_or(read_in_flight.next_available_log_offset)
     }
 
+    pub async fn get_first_unwritten_entry_offset_ge(
+        self: &Arc<Self>,
+        offset_inclusive: LogOffset,
+    ) -> Option<LogOffset> {
+        self.entries_in_flight
+            .read()
+            .await
+            .unwritten
+            .range(offset_inclusive..)
+            .next()
+            .copied()
+    }
+
+    pub async fn get_sealed_segments_end_log_offset(self: &Arc<Self>) -> Option<LogOffset> {
+        self.sealed_segments
+            .read()
+            .await
+            .last()
+            .map(|last_sealed_segment| last_sealed_segment.content_meta.end_log_offset)
+    }
+
     pub async fn run_fsync_loop(self: Arc<Self>) {
         let mut last_fsync = Instant::now();
-        let mut last_fsynced_log_offset = LogOffset(0);
         loop {
             let now = Instant::now();
             let till_next_fsync =
@@ -577,7 +618,7 @@ impl Node {
 
             let first_unwritten_log_offset = self.get_first_unwritten_log_offset().await;
 
-            if last_fsynced_log_offset == first_unwritten_log_offset {
+            if self.fsynced_log_offset.load(SeqCst) == first_unwritten_log_offset.0 {
                 continue;
             }
 
@@ -649,7 +690,8 @@ impl Node {
 
             // Only after successfully looping and fsyncing and/or closing all matching segments
             // we update `last_fsynced_log_offset`
-            last_fsynced_log_offset = first_unwritten_log_offset;
+            self.fsynced_log_offset
+                .store(first_unwritten_log_offset.0, SeqCst);
         }
     }
 }
