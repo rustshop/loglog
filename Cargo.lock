@@ -214,7 +214,7 @@ dependencies = [
  "num_enum",
  "thiserror",
  "tokio",
- "tokio-uring",
+ "tokio-uring 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "tracing",
  "tracing-subscriber",
  "typed-builder",
@@ -232,7 +232,7 @@ dependencies = [
  "num_enum",
  "thiserror",
  "tokio",
- "tokio-uring",
+ "tokio-uring 0.3.0 (git+https://github.com/dpc/tokio-uring?branch=tcpstream-as-raw-fd)",
  "tracing",
  "tracing-subscriber",
  "typed-builder",
@@ -605,6 +605,19 @@ name = "tokio-uring"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3ad494f39874984d990ade7f6319dafbcd3301ff0b1841f8a55a1ebb3e742c8"
+dependencies = [
+ "io-uring",
+ "libc",
+ "scoped-tls",
+ "slab",
+ "socket2",
+ "tokio",
+]
+
+[[package]]
+name = "tokio-uring"
+version = "0.3.0"
+source = "git+https://github.com/dpc/tokio-uring?branch=tcpstream-as-raw-fd#5fc5790d879bc32d3809450fc2d596c3901db7b9"
 dependencies = [
  "io-uring",
  "libc",

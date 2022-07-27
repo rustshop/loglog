@@ -1,4 +1,5 @@
 #![feature(map_first_last)]
+#![deny(clippy::as_conversions)]
 use binrw::{BinRead, BinWrite, ReadOptions, WriteOptions};
 use derive_more::{Add, Sub};
 use node::{Parameters, TermId};
@@ -217,6 +218,8 @@ pub enum ConnectionError {
     ParseError(#[from] binrw::Error),
     #[error("io")]
     IO(#[from] io::Error),
+    #[error("io")]
+    JoinError(#[from] tokio::task::JoinError),
 }
 
 pub type RingConnectionResult<T> = (ConnectionResult<T>, Vec<u8>);

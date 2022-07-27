@@ -1,6 +1,8 @@
 use binrw::{BinRead, BinWrite};
+use std::cmp;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Cursor};
+use std::os::unix::prelude::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::SeqCst;
@@ -83,7 +85,7 @@ pub struct Node {
     open_segments: RwLock<OpenSegments>,
 
     /// Known segments, sorted by `stream_offset`
-    sealed_segments: RwLock<Vec<SegmentMeta>>,
+    sealed_segments: RwLock<BTreeMap<LogOffset, SegmentMeta>>,
     pub entry_writer_tx: Sender<EntryWrite>,
 
     fsynced_log_offset: AtomicU64,
@@ -108,7 +110,12 @@ impl Node {
                     .unwrap_or(LogOffset(0)),
                 unwritten: BTreeSet::new(),
             }),
-            sealed_segments: RwLock::new(sealed_segments),
+            sealed_segments: RwLock::new(
+                sealed_segments
+                    .into_iter()
+                    .map(|s| (s.content_meta.start_log_offset, s))
+                    .collect(),
+            ),
             open_segments: RwLock::new(OpenSegments {
                 inner: BTreeMap::new(),
                 future_rx: future_segments,
@@ -564,15 +571,197 @@ impl Node {
         read_res
     }
 
+    async fn write_read_response_size(
+        self: &Arc<Node>,
+        stream: &mut TcpStream,
+        response_size: u32,
+    ) -> ConnectionResult<()> {
+        use std::io::Write as _;
+        let mut buf = self.pop_entry_buffer().await;
+        vec_extend_to_at_least(&mut buf, 4);
+        (&mut buf).write_all(&response_size.to_be_bytes())?;
+        let (res, res_buf) = tcpstream_write_all(stream, buf.slice(0..4)).await;
+        self.put_entry_buffer(res_buf).await;
+
+        res
+    }
+
+    /// Send as much data (under `data_to_send` limit) from the log at `log_offset` as possible
+    async fn handle_read_request_send_data(
+        self: &Arc<Node>,
+        stream: &mut TcpStream,
+        log_offset: &mut LogOffset,
+        num_bytes_to_send: &mut u32,
+    ) -> ConnectionResult<()> {
+        // first try serving from sealed files
+        while 0 < *num_bytes_to_send {
+            let read_sealed_segments = self.sealed_segments.read().await;
+
+            let (segment_start_log_offset, segment) =
+                if let Some(segment) = read_sealed_segments.range(..=*log_offset).next_back() {
+                    (segment.0.clone(), segment.1.clone())
+                } else {
+                    // if we couldn't find any segments below `log_offset`, that must
+                    // mean there are no sealed segments at all, otherwise there wouldn't
+                    // be any commited bytes to send and we wouldn't be here
+                    debug_assert!(read_sealed_segments.is_empty());
+                    break;
+                };
+
+            if segment.content_meta.end_log_offset <= *log_offset {
+                // Offset after last sealed segments. `log_offset` must be in an opened segment then.
+                // Break into the open segment loop search.
+                break;
+            }
+            drop(read_sealed_segments);
+
+            debug_assert!(segment_start_log_offset <= *log_offset);
+            let bytes_available_in_segment = segment.content_meta.end_log_offset.0 - log_offset.0;
+            let mut file_offset = log_offset.0 - segment.content_meta.start_log_offset.0;
+
+            debug_assert!(0 < bytes_available_in_segment);
+
+            // TODO(perf): allocates
+            let path = self.params.db_path.join(&segment.file_meta.id_str);
+
+            // TODO(perf): should we cache these somewhere in some LRU or something?
+            let file = tokio_uring::fs::File::open(path).await?;
+
+            let mut bytes_to_send =
+                cmp::min(bytes_available_in_segment, u64::from(*num_bytes_to_send));
+            let stream_fd = stream.as_raw_fd();
+            let file_fd = file.as_raw_fd();
+            let bytes_written_total = tokio::task::spawn_blocking(move || -> io::Result<u64> {
+                let mut bytes_written_total = 0u64;
+                while 0 < bytes_to_send {
+                    let mut file_offset_mut: i64 = i64::try_from(file_offset).expect("can't fail");
+                    // TODO: fallback to `send`?
+                    let bytes_sent = nix::sys::sendfile::sendfile64(
+                        stream_fd,
+                        file_fd,
+                        Some(&mut file_offset_mut),
+                        usize::try_from(bytes_to_send).expect("can't fail"),
+                    )
+                    .map_err(io::Error::from)?;
+
+                    let bytes_sent = u64::try_from(bytes_sent).expect("can't fail");
+
+                    bytes_to_send -= bytes_sent;
+                    file_offset += u64::try_from(bytes_sent).expect("can't fail");
+                    bytes_written_total += bytes_sent;
+                }
+                Ok(u64::try_from(bytes_written_total).expect("can't fail"))
+            })
+            .await??;
+            *num_bytes_to_send -= u32::try_from(bytes_written_total).expect("can't fail");
+            log_offset.0 += u64::from(bytes_written_total);
+        }
+
+        // if more data is still needed, it's probably in the still opened buffers
+        while 0 < *num_bytes_to_send {
+            let read_open_segments = self.open_segments.read().await;
+
+            let (segment_start_log_offset, segment) =
+                if let Some(segment) = read_open_segments.inner.range(..=*log_offset).next_back() {
+                    (segment.0.clone(), segment.1.clone())
+                } else {
+                    // This means we couldn't find a matching open segment. This
+                    // must be because we missed a segment that was moved between
+                    // opened and sealed group.
+                    break;
+                };
+
+            // Since segments are closed in order, from lowest offset upward,
+            // if we were able to find an open segment starting just before the
+            // requested offset, the data must be in this segment. The question
+            // is only how much of it can we serve, before switching
+            // to next segment.
+
+            let segment_end_log_offset = if let Some(segment) = read_open_segments
+                .inner
+                .range((*log_offset + LogOffset(1))..)
+                .next()
+            {
+                *segment.0
+            } else {
+                // No open segments after current one (at least yet).
+                // Just use request data as the end pointer
+                LogOffset(log_offset.0 + u64::from(*num_bytes_to_send))
+            };
+
+            drop(read_open_segments);
+
+            debug_assert!(segment_start_log_offset <= *log_offset);
+            let bytes_available_in_segment = segment_end_log_offset.0 - log_offset.0;
+            let mut file_offset = log_offset.0 - segment_start_log_offset.0;
+
+            debug_assert!(0 < bytes_available_in_segment);
+
+            let mut bytes_to_send =
+                cmp::min(bytes_available_in_segment, u64::from(*num_bytes_to_send));
+            let stream_fd = stream.as_raw_fd();
+            let file_fd = segment.file.as_raw_fd();
+            // TODO: move to a function, dedup with the block above
+            let bytes_written_total = tokio::task::spawn_blocking(move || -> io::Result<u64> {
+                let mut bytes_written_total = 0u64;
+                while 0 < bytes_to_send {
+                    let mut file_offset_mut: i64 = i64::try_from(file_offset).expect("can't fail");
+                    // TODO: fallback to `send`?
+                    let bytes_sent = nix::sys::sendfile::sendfile64(
+                        stream_fd,
+                        file_fd,
+                        Some(&mut file_offset_mut),
+                        usize::try_from(bytes_to_send).expect("can't fail"),
+                    )
+                    .map_err(io::Error::from)?;
+
+                    let bytes_sent = u64::try_from(bytes_sent).expect("can't fail");
+
+                    bytes_to_send -= bytes_sent;
+                    file_offset += u64::try_from(bytes_sent).expect("can't fail");
+                    bytes_written_total += bytes_sent;
+                }
+                Ok(u64::try_from(bytes_written_total).expect("can't fail"))
+            })
+            .await??;
+            *num_bytes_to_send -= u32::try_from(bytes_written_total).expect("can't fail");
+            log_offset.0 += u64::from(bytes_written_total);
+        }
+        Ok(())
+    }
+
     async fn handle_read_request(
         self: &Arc<Node>,
         stream: &mut TcpStream,
-        log_offset: LogOffset,
+        mut log_offset: LogOffset,
         limit: u32,
     ) -> ConnectionResult<()> {
-        let read_sealed_segments = self.sealed_segments.read().await;
+        // TODO: change this to `commited_log_offset` when Raft is implemented
+        let last_fsynced_log_offset = LogOffset(self.fsynced_log_offset.load(SeqCst));
 
-        todo!();
+        let commited_data_available = if last_fsynced_log_offset <= log_offset {
+            0
+        } else {
+            log_offset.0 - last_fsynced_log_offset.0
+        };
+
+        let mut num_bytes_to_send =
+            u32::try_from(cmp::min(u64::from(limit), commited_data_available)).expect("can't fail");
+
+        self.write_read_response_size(stream, num_bytes_to_send)
+            .await?;
+
+        // Because we have two sources of data (sealed and opened segments), and
+        // no good (desireable) way to lock both of the them at the same time,
+        // we possibly can miss some data between when the segment is closed
+        // and added to sealed segments. But that's not a big issue, we can
+        // loop and try again.
+        while 0 < num_bytes_to_send {
+            self.handle_read_request_send_data(stream, &mut log_offset, &mut num_bytes_to_send)
+                .await?;
+        }
+
+        Ok(())
     }
 
     pub async fn get_first_unwritten_log_offset(self: &Arc<Self>) -> LogOffset {
@@ -602,8 +791,8 @@ impl Node {
         self.sealed_segments
             .read()
             .await
-            .last()
-            .map(|last_sealed_segment| last_sealed_segment.content_meta.end_log_offset)
+            .last_key_value()
+            .map(|(_, last_sealed_segment)| last_sealed_segment.content_meta.end_log_offset)
     }
 
     pub async fn run_fsync_loop(self: Arc<Self>) {
@@ -659,16 +848,20 @@ impl Node {
                         // any readers looking for their data can't miss it between removal and addition.
                         {
                             let mut write_sealed_segments = self.sealed_segments.write().await;
-                            write_sealed_segments.push(SegmentMeta {
-                                file_meta: SegmentFileMeta::new(
-                                    first_segment.id,
-                                    first_segment_offset_size + SegmentFileHeader::BYTE_SIZE_U64,
-                                ),
-                                content_meta: segment::SegmentContentMeta {
-                                    start_log_offset: *first_segment_start_log_offset,
-                                    end_log_offset: first_segment_end_log_offset,
+                            write_sealed_segments.insert(
+                                *first_segment_start_log_offset,
+                                SegmentMeta {
+                                    file_meta: SegmentFileMeta::new(
+                                        first_segment.id,
+                                        first_segment_offset_size
+                                            + SegmentFileHeader::BYTE_SIZE_U64,
+                                    ),
+                                    content_meta: segment::SegmentContentMeta {
+                                        start_log_offset: *first_segment_start_log_offset,
+                                        end_log_offset: first_segment_end_log_offset,
+                                    },
                                 },
-                            });
+                            );
                             drop(write_sealed_segments);
                         }
                         {
