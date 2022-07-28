@@ -116,21 +116,32 @@ pub struct SegmentMeta {
 pub struct SegmentFileMeta {
     // Segments are sequentially numbered and `id` used to create their name
     pub id: u64,
-    /// Id in a `String` version, to avoid redoing it
+    /// Id in a `String` version, to avoid redoing it; TODO: are we using it instead of a path?
     pub id_str: String,
+
+    /// Path to a file, to avoid redoing (allocating)
+    pub path: PathBuf,
 
     pub file_len: u64,
 }
 
 impl SegmentFileMeta {
-    pub fn new(id: u64, file_len: u64) -> Self {
+    pub fn new(id: u64, file_len: u64, path: PathBuf) -> Self {
         Self {
             id,
             id_str: format!("{:#016}", id),
             file_len,
+            path,
         }
     }
+
+    pub(crate) fn get_path(db_path: &Path, id: u64) -> PathBuf {
+        let mut path = db_path.join(format!("{:#016}", id));
+        path.set_extension(SegmentFileMeta::FILE_EXTENSION);
+        path
+    }
 }
+
 /// Data about segment content from the file content itself (mostly header)
 #[derive(Debug, Copy, Clone)]
 pub struct SegmentContentMeta {
@@ -212,6 +223,7 @@ impl LogStore {
                 id,
                 id_str,
                 file_len: metadata.len(),
+                path: SegmentFileMeta::get_path(db_path, id),
             });
         }
 
@@ -412,6 +424,7 @@ impl SegmentParseErrorType {
 }
 
 impl SegmentFileMeta {
+    pub const FILE_EXTENSION: &'static str = "seg.loglog";
     pub const FILE_SUFFIX: &'static str = ".seg.loglog";
 
     fn file_name(&self) -> PathBuf {

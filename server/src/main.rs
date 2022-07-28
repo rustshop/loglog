@@ -1,7 +1,7 @@
 #![feature(map_first_last)]
 #![deny(clippy::as_conversions)]
 use binrw::{BinRead, BinWrite, ReadOptions, WriteOptions};
-use derive_more::{Add, Sub};
+use derive_more::{Add, Display, Sub};
 use node::{Parameters, TermId};
 use num_enum::FromPrimitive;
 use opts::Opts;
@@ -46,7 +46,9 @@ macro_rules! uring_try_rec {
 ///
 /// Notably LogLog for performance reasons includes each entry's
 /// header and trailer the log, but segment file header is not included.
-#[derive(Copy, Clone, Debug, BinRead, BinWrite, PartialEq, Eq, PartialOrd, Ord, Sub, Add)]
+#[derive(
+    Copy, Clone, Debug, BinRead, BinWrite, PartialEq, Eq, PartialOrd, Ord, Sub, Add, Display,
+)]
 #[br(big)]
 #[bw(big)]
 pub struct LogOffset(u64);
@@ -203,6 +205,7 @@ pub struct FillRequestHeader {
 }
 
 #[derive(BinRead, Debug)]
+#[br(big)]
 pub struct ReadRequestHeader {
     offset: LogOffset,
     limit: u32,
@@ -214,11 +217,11 @@ pub enum ConnectionError {
     Disconected,
     #[error("invalid data")]
     Invalid,
-    #[error("invalid data")]
+    #[error("invalid data: {0}")]
     ParseError(#[from] binrw::Error),
-    #[error("io")]
+    #[error("io: {0}")]
     IO(#[from] io::Error),
-    #[error("io")]
+    #[error("join: {0}")]
     JoinError(#[from] tokio::task::JoinError),
 }
 

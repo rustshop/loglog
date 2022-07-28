@@ -579,7 +579,7 @@ impl Node {
         use std::io::Write as _;
         let mut buf = self.pop_entry_buffer().await;
         vec_extend_to_at_least(&mut buf, 4);
-        (&mut buf).write_all(&response_size.to_be_bytes())?;
+        (&mut buf[0..4]).write_all(&response_size.to_be_bytes())?;
         let (res, res_buf) = tcpstream_write_all(stream, buf.slice(0..4)).await;
         self.put_entry_buffer(res_buf).await;
 
@@ -613,16 +613,18 @@ impl Node {
                 // Break into the open segment loop search.
                 break;
             }
+            // TODO(perf): allocates
+            let path = segment.file_meta.path.clone();
             drop(read_sealed_segments);
+
+            dbg!(&segment);
 
             debug_assert!(segment_start_log_offset <= *log_offset);
             let bytes_available_in_segment = segment.content_meta.end_log_offset.0 - log_offset.0;
-            let mut file_offset = log_offset.0 - segment.content_meta.start_log_offset.0;
+            let mut file_offset = log_offset.0 - segment.content_meta.start_log_offset.0
+                + SegmentFileHeader::BYTE_SIZE_U64;
 
             debug_assert!(0 < bytes_available_in_segment);
-
-            // TODO(perf): allocates
-            let path = self.params.db_path.join(&segment.file_meta.id_str);
 
             // TODO(perf): should we cache these somewhere in some LRU or something?
             let file = tokio_uring::fs::File::open(path).await?;
@@ -634,6 +636,12 @@ impl Node {
             let bytes_written_total = tokio::task::spawn_blocking(move || -> io::Result<u64> {
                 let mut bytes_written_total = 0u64;
                 while 0 < bytes_to_send {
+                    trace!(
+                        bytes_to_send,
+                        file_offset,
+                        segment_id = segment.file_meta.id,
+                        "sending sealed segment data"
+                    );
                     let mut file_offset_mut: i64 = i64::try_from(file_offset).expect("can't fail");
                     // TODO: fallback to `send`?
                     let bytes_sent = nix::sys::sendfile::sendfile64(
@@ -693,7 +701,8 @@ impl Node {
 
             debug_assert!(segment_start_log_offset <= *log_offset);
             let bytes_available_in_segment = segment_end_log_offset.0 - log_offset.0;
-            let mut file_offset = log_offset.0 - segment_start_log_offset.0;
+            let mut file_offset =
+                log_offset.0 - segment_start_log_offset.0 + SegmentFileHeader::BYTE_SIZE_U64;
 
             debug_assert!(0 < bytes_available_in_segment);
 
@@ -701,10 +710,17 @@ impl Node {
                 cmp::min(bytes_available_in_segment, u64::from(*num_bytes_to_send));
             let stream_fd = stream.as_raw_fd();
             let file_fd = segment.file.as_raw_fd();
+            let segment_id = segment.id;
             // TODO: move to a function, dedup with the block above
             let bytes_written_total = tokio::task::spawn_blocking(move || -> io::Result<u64> {
                 let mut bytes_written_total = 0u64;
                 while 0 < bytes_to_send {
+                    trace!(
+                        bytes_to_send,
+                        file_offset,
+                        segment_id,
+                        "sending open segment data"
+                    );
                     let mut file_offset_mut: i64 = i64::try_from(file_offset).expect("can't fail");
                     // TODO: fallback to `send`?
                     let bytes_sent = nix::sys::sendfile::sendfile64(
@@ -739,15 +755,23 @@ impl Node {
         // TODO: change this to `commited_log_offset` when Raft is implemented
         let last_fsynced_log_offset = LogOffset(self.fsynced_log_offset.load(SeqCst));
 
-        let commited_data_available = if last_fsynced_log_offset <= log_offset {
-            0
+        let commited_data_available = if log_offset < last_fsynced_log_offset {
+            last_fsynced_log_offset.0 - log_offset.0
         } else {
-            log_offset.0 - last_fsynced_log_offset.0
+            0
         };
 
         let mut num_bytes_to_send =
             u32::try_from(cmp::min(u64::from(limit), commited_data_available)).expect("can't fail");
 
+        trace!(
+            %last_fsynced_log_offset,
+            commited_data_available,
+            %log_offset,
+            limit,
+            num_bytes_to_send,
+            "read request"
+        );
         self.write_read_response_size(stream, num_bytes_to_send)
             .await?;
 
@@ -759,6 +783,14 @@ impl Node {
         while 0 < num_bytes_to_send {
             self.handle_read_request_send_data(stream, &mut log_offset, &mut num_bytes_to_send)
                 .await?;
+            trace!(
+                %last_fsynced_log_offset,
+                commited_data_available,
+                %log_offset,
+                limit,
+                num_bytes_to_send,
+                "read request progress"
+            );
         }
 
         Ok(())
@@ -855,6 +887,10 @@ impl Node {
                                         first_segment.id,
                                         first_segment_offset_size
                                             + SegmentFileHeader::BYTE_SIZE_U64,
+                                        SegmentFileMeta::get_path(
+                                            &self.params.db_path,
+                                            first_segment.id,
+                                        ),
                                     ),
                                     content_meta: segment::SegmentContentMeta {
                                         start_log_offset: *first_segment_start_log_offset,
