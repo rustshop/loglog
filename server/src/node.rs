@@ -1,4 +1,8 @@
 use binrw::{BinRead, BinWrite};
+use loglogd_api::{
+    AllocationId, AppendRequestHeader, EntryHeader, EntrySize, EntryTrailer, FillRequestHeader,
+    LogOffset, NodeId, ReadRequestHeader, RequestHeaderCmd, TermId,
+};
 use std::cmp;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Cursor};
@@ -20,22 +24,9 @@ use crate::ioutil::{
     file_write_all, tcpstream_read_fill, tcpstream_write_all, vec_extend_to_at_least,
 };
 use crate::segment::{
-    self, EntryHeader, EntryTrailer, EntryWrite, OpenSegment, SegmentFileHeader, SegmentFileMeta,
-    SegmentMeta,
+    self, EntryWrite, OpenSegment, SegmentFileHeader, SegmentFileMeta, SegmentMeta,
 };
-use crate::{
-    uring_try_rec, AllocationId, AppendRequestHeader, ConnectionError, ConnectionResult, EntrySize,
-    FillRequestHeader, HeaderCmd, LogOffset, ReadRequestHeader, RingConnectionResult,
-};
-
-#[derive(Copy, Clone, Debug, BinRead, PartialEq, Eq)]
-#[br(big)]
-pub struct NodeId(pub u8);
-
-#[derive(Copy, Clone, Debug, BinRead, BinWrite, PartialEq, Eq)]
-#[br(big)]
-#[bw(big)]
-pub struct TermId(pub u16);
+use crate::{uring_try_rec, ConnectionError, ConnectionResult, RingConnectionResult};
 
 /// Some parameters of runtime operation
 #[derive(TypedBuilder, Debug, Clone)]
@@ -407,7 +398,7 @@ impl Node {
             }
 
             let cursor = &mut Cursor::new(&buf[..14]);
-            let cmd = match HeaderCmd::read(cursor) {
+            let cmd = match RequestHeaderCmd::read(cursor) {
                 Ok(cmd) => cmd,
                 Err(e) => {
                     self.put_entry_buffer(buf).await;
@@ -416,10 +407,10 @@ impl Node {
             };
 
             match cmd {
-                HeaderCmd::Peer => {
+                RequestHeaderCmd::Peer => {
                     todo!();
                 }
-                HeaderCmd::Append => {
+                RequestHeaderCmd::Append => {
                     let args = match AppendRequestHeader::read(cursor) {
                         Ok(args) => args,
                         Err(e) => {
@@ -431,7 +422,7 @@ impl Node {
 
                     self.handle_append_request(stream, buf, args.size).await?;
                 }
-                HeaderCmd::Fill => {
+                RequestHeaderCmd::Fill => {
                     let args = match FillRequestHeader::read(cursor) {
                         Ok(args) => args,
                         Err(e) => {
@@ -444,7 +435,7 @@ impl Node {
                     self.handle_fill_request(stream, buf, args.allocation_id, args.size)
                         .await?;
                 }
-                HeaderCmd::Read => {
+                RequestHeaderCmd::Read => {
                     let args = match ReadRequestHeader::read(cursor) {
                         Ok(args) => args,
                         Err(e) => {
@@ -457,7 +448,7 @@ impl Node {
                     self.handle_read_request(stream, args.offset, args.limit)
                         .await?;
                 }
-                HeaderCmd::Other => Err(ConnectionError::Invalid)?,
+                RequestHeaderCmd::Other => Err(ConnectionError::Invalid)?,
             }
         }
     }
@@ -525,7 +516,7 @@ impl Node {
         let entry_header_size = EntryHeader::BYTE_SIZE;
         let entry_trailer_size = EntryTrailer::BYTE_SIZE;
         // TODO: allocation_id.term vs node.term
-        let header = segment::EntryHeader {
+        let header = EntryHeader {
             term: allocation_id.term,
             payload_size,
         };
@@ -616,8 +607,6 @@ impl Node {
             // TODO(perf): allocates
             let path = segment.file_meta.path.clone();
             drop(read_sealed_segments);
-
-            dbg!(&segment);
 
             debug_assert!(segment_start_log_offset <= *log_offset);
             let bytes_available_in_segment = segment.content_meta.end_log_offset.0 - log_offset.0;

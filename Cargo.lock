@@ -228,6 +228,7 @@ dependencies = [
  "clap",
  "derive_more",
  "error-stack",
+ "loglogd-api",
  "nix",
  "num_enum",
  "thiserror",
@@ -236,6 +237,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "typed-builder",
+]
+
+[[package]]
+name = "loglogd-api"
+version = "0.1.0"
+dependencies = [
+ "binrw",
+ "derive_more",
+ "num_enum",
 ]
 
 [[package]]

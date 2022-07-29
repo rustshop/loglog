@@ -8,6 +8,7 @@ use binrw::{
     io::{self},
     BinRead, BinWrite,
 };
+use loglogd_api::{EntryHeader, EntryTrailer, LogOffset};
 use nix::{fcntl::FallocateFlags, unistd::ftruncate};
 use thiserror::Error;
 use tokio_uring::{
@@ -16,12 +17,14 @@ use tokio_uring::{
 };
 use tracing::{debug, info, warn};
 
-use crate::{
-    ioutil::{file_write_all, vec_extend_to_at_least},
-    node::TermId,
-    EntrySize, LogOffset,
-};
+use crate::ioutil::{file_write_all, vec_extend_to_at_least};
 
+/// Segment file header
+///
+/// Every segment file starts with some internal data
+/// that is not considered a part of the actual log.
+/// Because of this, this is not a part of the public
+/// API.
 #[derive(BinRead, BinWrite, Debug)]
 #[br(big)]
 #[bw(big)]
@@ -48,59 +51,6 @@ impl SegmentFileHeader {
     pub const BYTE_SIZE_U64: u64 = 1 + 8 + 1;
 }
 
-#[derive(BinRead, BinWrite, Debug, Copy, Clone)]
-#[br(big)]
-#[bw(big)]
-pub struct EntryHeader {
-    pub term: TermId,
-    pub payload_size: EntrySize,
-}
-
-impl EntryHeader {
-    pub const BYTE_SIZE: usize = 5;
-    pub const BYTE_SIZE_U64: u64 = 5;
-}
-
-#[derive(BinRead, BinWrite, Debug)]
-#[br(big)]
-#[bw(big)]
-// Just something that we can detect at the end and make sure 0s turned into 1s
-pub struct EntryTrailer {
-    // 0xff = valid
-    // 0x55 = entry invalid (e.g. client disconnected before fully uploading)
-    #[br(assert(marker == Self::ENTRY_INVALID || marker == Self::ENTRY_VALID))]
-    marker: u8,
-}
-
-impl EntryTrailer {
-    pub const BYTE_SIZE: usize = 1;
-    pub const BYTE_SIZE_U64: u64 = 1;
-
-    pub const ENTRY_VALID: u8 = 0xff;
-    pub const ENTRY_INVALID: u8 = 0x55;
-
-    pub fn valid() -> Self {
-        Self {
-            marker: Self::ENTRY_VALID,
-        }
-    }
-
-    pub fn invalid() -> Self {
-        Self {
-            marker: Self::ENTRY_INVALID,
-        }
-    }
-
-    #[allow(unused)]
-    pub fn is_valid(self) -> Option<bool> {
-        match self.marker {
-            Self::ENTRY_VALID => Some(true),
-            Self::ENTRY_INVALID => Some(false),
-            _ => None,
-        }
-    }
-}
-
 /// Information about a segement
 #[derive(Clone, Debug)]
 pub struct SegmentMeta {
@@ -116,8 +66,6 @@ pub struct SegmentMeta {
 pub struct SegmentFileMeta {
     // Segments are sequentially numbered and `id` used to create their name
     pub id: u64,
-    /// Id in a `String` version, to avoid redoing it; TODO: are we using it instead of a path?
-    pub id_str: String,
 
     /// Path to a file, to avoid redoing (allocating)
     pub path: PathBuf,
@@ -127,12 +75,7 @@ pub struct SegmentFileMeta {
 
 impl SegmentFileMeta {
     pub fn new(id: u64, file_len: u64, path: PathBuf) -> Self {
-        Self {
-            id,
-            id_str: format!("{:#016}", id),
-            file_len,
-            path,
-        }
+        Self { id, file_len, path }
     }
 
     pub(crate) fn get_path(db_path: &Path, id: u64) -> PathBuf {
@@ -221,7 +164,6 @@ impl LogStore {
 
             segments.push(SegmentFileMeta {
                 id,
-                id_str,
                 file_len: metadata.len(),
                 path: SegmentFileMeta::get_path(db_path, id),
             });
@@ -259,9 +201,9 @@ impl LogStore {
             let last = segments.last().expect("not empty");
             info!(
                 start_pos = first.content_meta.start_log_offset.0,
-                start_segment = first.file_meta.id_str,
+                start_segment = first.file_meta.id,
                 end_post = last.content_meta.end_log_offset.0,
-                end_segment = last.file_meta.id_str,
+                end_segment = last.file_meta.id,
                 num_segments = segments.len(),
                 "Segments loaded"
             );
@@ -428,7 +370,7 @@ impl SegmentFileMeta {
     pub const FILE_SUFFIX: &'static str = ".seg.loglog";
 
     fn file_name(&self) -> PathBuf {
-        PathBuf::from(format!("{}{}", self.id_str, Self::FILE_SUFFIX))
+        PathBuf::from(format!("{:#016}{}", self.id, Self::FILE_SUFFIX))
     }
 }
 

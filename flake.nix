@@ -80,12 +80,12 @@
         });
 
         # a function to define both package and container build for a given binary
-        pkg = { name, dir }: rec {
+        pkg = { name, dir, extraDirs ? [ ] }: rec {
           package = craneLib.buildPackage (commonArgs // {
             cargoArtifacts = workspaceDeps;
             pname = name;
 
-            src = filterModules [ dir ] ./.;
+            src = filterModules ([ dir ] ++ extraDirs) ./.;
 
             cargoExtraArgs = "--bin ${name}";
             doCheck = false;
@@ -105,7 +105,7 @@
           };
         };
 
-        loglogd = pkg { name = "loglogd"; dir = "server"; };
+        loglogd = pkg { name = "loglogd"; dir = "server"; extraDirs = [ "api" ]; };
 
       in
       {
