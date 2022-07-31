@@ -1,7 +1,8 @@
 use binrw::{BinRead, BinWrite};
+use convi::ExpectFrom;
 use loglogd_api::{
     AllocationId, AppendRequestHeader, EntryHeader, EntrySize, EntryTrailer, FillRequestHeader,
-    LogOffset, NodeId, ReadRequestHeader, RequestHeaderCmd, TermId,
+    LogOffset, NodeId, ReadDataSize, ReadRequestHeader, RequestHeaderCmd, TermId,
 };
 use std::cmp;
 use std::collections::{BTreeMap, BTreeSet};
@@ -502,9 +503,7 @@ impl Node {
                 tcpstream_read_fill(
                     stream,
                     entry_buf.slice(
-                        entry_header_size
-                            ..(entry_header_size
-                                + usize::try_from(payload_size.0).expect("can't fail"))
+                        entry_header_size..(entry_header_size + usize::expect_from(payload_size.0))
                     )
                 )
                 .await
@@ -521,9 +520,8 @@ impl Node {
             payload_size,
         };
 
-        let total_entry_size = entry_header_size
-            + usize::try_from(payload_size.0).expect("not fail")
-            + entry_trailer_size;
+        let total_entry_size =
+            entry_header_size + usize::expect_from(payload_size.0) + entry_trailer_size;
         vec_extend_to_at_least(&mut buf, total_entry_size);
 
         header
@@ -631,26 +629,26 @@ impl Node {
                         segment_id = segment.file_meta.id,
                         "sending sealed segment data"
                     );
-                    let mut file_offset_mut: i64 = i64::try_from(file_offset).expect("can't fail");
+                    let mut file_offset_mut: i64 = i64::expect_from(file_offset);
                     // TODO: fallback to `send`?
                     let bytes_sent = nix::sys::sendfile::sendfile64(
                         stream_fd,
                         file_fd,
                         Some(&mut file_offset_mut),
-                        usize::try_from(bytes_to_send).expect("can't fail"),
+                        usize::expect_from(bytes_to_send),
                     )
                     .map_err(io::Error::from)?;
 
-                    let bytes_sent = u64::try_from(bytes_sent).expect("can't fail");
+                    let bytes_sent = u64::expect_from(bytes_sent);
 
                     bytes_to_send -= bytes_sent;
-                    file_offset += u64::try_from(bytes_sent).expect("can't fail");
+                    file_offset += u64::expect_from(bytes_sent);
                     bytes_written_total += bytes_sent;
                 }
-                Ok(u64::try_from(bytes_written_total).expect("can't fail"))
+                Ok(u64::expect_from(bytes_written_total))
             })
             .await??;
-            *num_bytes_to_send -= u32::try_from(bytes_written_total).expect("can't fail");
+            *num_bytes_to_send -= u32::expect_from(bytes_written_total);
             log_offset.0 += u64::from(bytes_written_total);
         }
 
@@ -710,26 +708,26 @@ impl Node {
                         segment_id,
                         "sending open segment data"
                     );
-                    let mut file_offset_mut: i64 = i64::try_from(file_offset).expect("can't fail");
+                    let mut file_offset_mut: i64 = i64::expect_from(file_offset);
                     // TODO: fallback to `send`?
                     let bytes_sent = nix::sys::sendfile::sendfile64(
                         stream_fd,
                         file_fd,
                         Some(&mut file_offset_mut),
-                        usize::try_from(bytes_to_send).expect("can't fail"),
+                        usize::expect_from(bytes_to_send),
                     )
                     .map_err(io::Error::from)?;
 
-                    let bytes_sent = u64::try_from(bytes_sent).expect("can't fail");
+                    let bytes_sent = u64::expect_from(bytes_sent);
 
                     bytes_to_send -= bytes_sent;
-                    file_offset += u64::try_from(bytes_sent).expect("can't fail");
+                    file_offset += u64::expect_from(bytes_sent);
                     bytes_written_total += bytes_sent;
                 }
-                Ok(u64::try_from(bytes_written_total).expect("can't fail"))
+                Ok(u64::expect_from(bytes_written_total))
             })
             .await??;
-            *num_bytes_to_send -= u32::try_from(bytes_written_total).expect("can't fail");
+            *num_bytes_to_send -= u32::expect_from(bytes_written_total);
             log_offset.0 += u64::from(bytes_written_total);
         }
         Ok(())
@@ -739,7 +737,7 @@ impl Node {
         self: &Arc<Node>,
         stream: &mut TcpStream,
         mut log_offset: LogOffset,
-        limit: u32,
+        limit: ReadDataSize,
     ) -> ConnectionResult<()> {
         // TODO: change this to `commited_log_offset` when Raft is implemented
         let last_fsynced_log_offset = LogOffset(self.fsynced_log_offset.load(SeqCst));
@@ -751,13 +749,13 @@ impl Node {
         };
 
         let mut num_bytes_to_send =
-            u32::try_from(cmp::min(u64::from(limit), commited_data_available)).expect("can't fail");
+            u32::expect_from(cmp::min(u64::from(limit.0), commited_data_available));
 
         trace!(
             %last_fsynced_log_offset,
             commited_data_available,
             %log_offset,
-            limit,
+            limit = limit.0,
             num_bytes_to_send,
             "read request"
         );
@@ -776,7 +774,7 @@ impl Node {
                 %last_fsynced_log_offset,
                 commited_data_available,
                 %log_offset,
-                limit,
+                limit = limit.0,
                 num_bytes_to_send,
                 "read request progress"
             );

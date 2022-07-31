@@ -1,12 +1,13 @@
-use binrw::BinRead;
-use num_enum::FromPrimitive;
+use binrw::{BinRead, BinWrite};
+use num_enum::{FromPrimitive, IntoPrimitive};
 
 use crate::{AllocationId, EntrySize, LogOffset};
 
+pub const REQUEST_HEADER_SIZE: usize = 14;
 /// Request header- command
 ///
 /// Every request starts with a one byte command
-#[derive(FromPrimitive, Debug)]
+#[derive(FromPrimitive, IntoPrimitive, Debug)]
 #[repr(u8)]
 #[derive(BinRead)]
 #[br(repr = u8)]
@@ -33,9 +34,19 @@ pub struct FillRequestHeader {
 }
 
 /// Arguments for [`RequestHeaderCmd::Read`]
-#[derive(BinRead, Debug)]
+#[derive(BinRead, BinWrite, Debug)]
 #[br(big)]
+#[bw(big)]
 pub struct ReadRequestHeader {
     pub offset: LogOffset,
-    pub limit: u32,
+    pub limit: ReadDataSize,
+}
+
+#[derive(BinRead, BinWrite, Debug)]
+#[br(big)]
+#[bw(big)]
+pub struct ReadDataSize(pub u32);
+
+impl ReadDataSize {
+    pub const BYTE_SIZE: usize = 4;
 }

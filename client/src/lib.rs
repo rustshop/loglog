@@ -1,9 +1,13 @@
-use binrw::BinRead;
-use loglogd_api::{EntryHeader, EntryTrailer, LogOffset};
+use binrw::{BinRead, BinWrite};
+use convi::{CastFrom, ExpectFrom};
+use loglogd_api::{
+    EntryHeader, EntryTrailer, LogOffset, ReadDataSize, ReadRequestHeader, RequestHeaderCmd,
+    REQUEST_HEADER_SIZE,
+};
 use std::io::Cursor;
 use std::{io, net::SocketAddr};
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::io::{ReadHalf, WriteHalf};
 
 #[derive(Error, Debug)]
@@ -56,7 +60,7 @@ impl Client {
         let header = EntryHeader::read(&mut Cursor::new(&self.buf[self.next_event_i..]))?;
 
         while self.bytes_available()
-            < usize::try_from(header.payload_size.0).expect("can't fail")
+            < usize::expect_from(header.payload_size.0)
                 + EntryHeader::BYTE_SIZE
                 + EntryTrailer::BYTE_SIZE
         {
@@ -73,7 +77,7 @@ impl Client {
 
         self.next_event_i += EntryHeader::BYTE_SIZE
             + EntryTrailer::BYTE_SIZE
-            + usize::try_from(header.payload_size.0).expect("can't fail");
+            + usize::expect_from(header.payload_size.0);
 
         Ok(Some(
             &self.buf[payload_i..payload_i + self.next_event_i - EntryTrailer::BYTE_SIZE],
@@ -88,10 +92,47 @@ impl Client {
     }
 
     async fn fetch_more_data(&mut self) -> Result<()> {
+        let mut cmd_buf = [0u8; REQUEST_HEADER_SIZE];
+
+        let mut cursor = Cursor::new(&mut cmd_buf[0..]);
+
+        std::io::Write::write_all(&mut cursor, &[RequestHeaderCmd::Read.into()])
+            .expect("can't fail");
+
+        let args = ReadRequestHeader {
+            offset: self.log_offset,
+            limit: ReadDataSize(1024 * 64),
+        };
+
+        args.write_to(&mut cursor).expect("can't fail");
+        self.conn_write.write_all(&cmd_buf).await?;
+
+        let mut data_size_buf = [0u8; ReadDataSize::BYTE_SIZE];
+
+        self.conn_read.read_exact(&mut data_size_buf).await?;
+
+        let data_size = ReadDataSize::read(&mut Cursor::new(data_size_buf.as_slice()))?.0;
+        // TODO(perf): read into uninitialized buffer
+        // https://github.com/rust-lang/rust/issues/78485
         let prev_len = self.buf.len();
-        todo!(); /* send the command first */
-        let read = self.conn_read.read(&mut self.buf).await?;
-        debug_assert_eq!(prev_len + read, self.buf.len());
+        let new_len = prev_len + usize::cast_from(data_size);
+        self.buf.resize(new_len, 0);
+        match self
+            .conn_read
+            .read_exact(&mut self.buf[prev_len..new_len])
+            .await
+        {
+            Ok(read) => {
+                debug_assert_eq!(read, usize::cast_from(data_size));
+                self.log_offset.0 += u64::from(data_size);
+            }
+            Err(e) => {
+                // on failure, just discard any partially read data and move on
+                // in case the client ever retries
+                self.buf.truncate(prev_len);
+                Err(e)?;
+            }
+        };
 
         Ok(())
     }
@@ -115,8 +156,4 @@ impl Client {
     fn bytes_available(&mut self) -> usize {
         self.buf.len() - self.next_event_i
     }
-}
-
-pub fn lib() {
-    // sorry, just booking a name
 }

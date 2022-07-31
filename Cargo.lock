@@ -120,6 +120,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6245d59a3e82a7fc217c5828a6692dbc6dfb63a0c8c90495621f7b9d79704a0e"
 
 [[package]]
+name = "convi"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0065a247829db5fa783ee4c5a1b52f77db4c12fd4edb355c485d2d5040eeb36e"
+
+[[package]]
+name = "convi"
+version = "0.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83058f8e26f29f8f1bca9e857a07062e1cc0e458e6fedd4efa7c9e903d51f27e"
+
+[[package]]
 name = "derive_more"
 version = "0.99.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -209,6 +221,7 @@ version = "0.1.0"
 dependencies = [
  "binrw",
  "clap",
+ "convi 0.0.5",
  "error-stack",
  "loglogd-api",
  "nix",
@@ -227,6 +240,7 @@ version = "0.1.0"
 dependencies = [
  "binrw",
  "clap",
+ "convi 0.0.4",
  "derive_more",
  "error-stack",
  "loglogd-api",
