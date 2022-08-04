@@ -21,7 +21,9 @@ pub enum RequestHeaderCmd {
 }
 
 /// Arguments for [`RequestHeaderCmd::Append`]
-#[derive(BinRead, Debug)]
+#[derive(BinRead, BinWrite, Debug)]
+#[br(big)]
+#[bw(big)]
 pub struct AppendRequestHeader {
     pub size: EntrySize,
 }

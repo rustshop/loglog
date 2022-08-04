@@ -13,6 +13,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::join;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::sleep;
@@ -456,42 +457,43 @@ impl Node {
 
     async fn handle_append_request(
         self: &Arc<Node>,
-        stream: &mut TcpStream,
+        stream: &TcpStream,
         buf: Vec<u8>,
         entry_size: EntrySize,
     ) -> ConnectionResult<()> {
         let allocation_id = self.allocate_new_entry(entry_size).await;
 
-        // TODO: send the allocation id right away, in parallel, flush it, so the client can
-        // start uploading to other nodes immediately
-
-        self.handle_fill_request(stream, buf, allocation_id, entry_size)
-            .await?;
-
-        debug!("Sending response to append request");
         let mut resp_buf = self.pop_entry_buffer().await;
-        // 0-byte == 0 -> success
-        let res_size = 1 + AllocationId::BYTE_SIZE;
-        vec_extend_to_at_least(&mut resp_buf, res_size);
 
-        resp_buf[1..res_size].copy_from_slice(&allocation_id.to_bytes());
+        let (fill_res, (send_res, res_buf)) = join!(
+            self.handle_fill_request(stream, buf, allocation_id, entry_size),
+            async {
+                debug!("Sending response to append request");
+                let res_size = AllocationId::BYTE_SIZE;
+                vec_extend_to_at_least(&mut resp_buf, res_size);
 
-        let (res, res_buf) = tcpstream_write_all(stream, resp_buf.slice(..res_size)).await;
+                resp_buf[0..res_size].copy_from_slice(&allocation_id.to_bytes());
+
+                tcpstream_write_all(stream, resp_buf.slice(..res_size)).await
+            },
+        );
 
         self.put_entry_buffer(res_buf).await;
 
-        res
+        fill_res?;
+
+        send_res
     }
 
     async fn handle_fill_request(
         self: &Arc<Node>,
-        stream: &mut TcpStream,
+        stream: &TcpStream,
         mut buf: Vec<u8>,
         allocation_id: AllocationId,
         payload_size: EntrySize,
     ) -> ConnectionResult<()> {
         async fn read_payload(
-            stream: &mut TcpStream,
+            stream: &TcpStream,
             mut entry_buf: Vec<u8>,
             payload_size: EntrySize,
         ) -> RingConnectionResult<()> {

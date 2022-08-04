@@ -1,14 +1,15 @@
 use binrw::{BinRead, BinWrite};
 use convi::{CastFrom, ExpectFrom};
 use loglogd_api::{
-    EntryHeader, EntryTrailer, LogOffset, ReadDataSize, ReadRequestHeader, RequestHeaderCmd,
-    REQUEST_HEADER_SIZE,
+    AllocationId, AppendRequestHeader, EntryHeader, EntrySize, EntryTrailer, LogOffset,
+    ReadDataSize, ReadRequestHeader, RequestHeaderCmd, REQUEST_HEADER_SIZE,
 };
 use std::io::Cursor;
 use std::{io, net::SocketAddr};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::io::{ReadHalf, WriteHalf};
+use tokio::try_join;
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -51,7 +52,11 @@ impl Client {
         })
     }
 
-    pub async fn next_inner(&mut self) -> Result<Option<&[u8]>> {
+    /// Return next raw entry
+    ///
+    /// This returns `None` for entries that turned out to be invalid
+    /// and should be ignored.
+    pub async fn next_raw(&mut self) -> Result<Option<&[u8]>> {
         debug_assert!(self.next_event_i <= self.buf.len());
 
         self.maybe_compact_buf();
@@ -84,7 +89,7 @@ impl Client {
         ))
     }
 
-    pub async fn fetch_header(&mut self) -> Result<()> {
+    async fn fetch_header(&mut self) -> Result<()> {
         while !self.has_header() {
             self.fetch_more_data().await?;
         }
@@ -155,5 +160,39 @@ impl Client {
 
     fn bytes_available(&mut self) -> usize {
         self.buf.len() - self.next_event_i
+    }
+
+    pub async fn append(&mut self, raw_entry: &[u8]) -> Result<()> {
+        let mut cmd_buf = [0u8; REQUEST_HEADER_SIZE];
+
+        let mut cursor = Cursor::new(&mut cmd_buf[0..]);
+
+        std::io::Write::write_all(&mut cursor, &[RequestHeaderCmd::Append.into()])
+            .expect("can't fail");
+
+        let args = AppendRequestHeader {
+            size: EntrySize(u32::expect_from(raw_entry.len())),
+        };
+
+        args.write_to(&mut cursor).expect("can't fail");
+        self.conn_write.write_all(&cmd_buf).await?;
+
+        let mut entry_log_offset_buf = [0u8; AllocationId::BYTE_SIZE];
+
+        let (offset, sent) = try_join!(
+            async {
+                self.conn_read.read_exact(&mut entry_log_offset_buf).await?;
+
+                let allocation_id = AllocationId::read(&mut Cursor::new(&entry_log_offset_buf));
+                // TODO: in the future here we will start sending the `raw_entry` to other peers
+                // right away using `Fill` call
+
+                self.conn_read.read_u8().await?;
+                Ok(allocation_id)
+            },
+            self.conn_write.write_all(&raw_entry)
+        )?;
+
+        Ok(())
     }
 }

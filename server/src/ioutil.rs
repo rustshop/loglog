@@ -14,7 +14,7 @@ pub fn vec_extend_to_at_least(v: &mut Vec<u8>, len: usize) {
 }
 
 pub async fn tcpstream_read_fill(
-    stream: &mut tokio_uring::net::TcpStream,
+    stream: &tokio_uring::net::TcpStream,
     mut buf: Slice<Vec<u8>>,
 ) -> RingConnectionResult<()> {
     while !buf.is_empty() {
