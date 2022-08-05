@@ -228,7 +228,6 @@ dependencies = [
  "num_enum",
  "thiserror",
  "tokio",
- "tokio-uring 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "tracing",
  "tracing-subscriber",
  "typed-builder",
@@ -248,7 +247,7 @@ dependencies = [
  "num_enum",
  "thiserror",
  "tokio",
- "tokio-uring 0.3.0 (git+https://github.com/dpc/tokio-uring?branch=tcpstream-as-raw-fd)",
+ "tokio-uring",
  "tracing",
  "tracing-subscriber",
  "typed-builder",
@@ -261,6 +260,25 @@ dependencies = [
  "binrw",
  "derive_more",
  "num_enum",
+]
+
+[[package]]
+name = "loglogd-e2e-tests"
+version = "0.1.0"
+dependencies = [
+ "binrw",
+ "clap",
+ "convi 0.0.5",
+ "derive_more",
+ "error-stack",
+ "loglog-client",
+ "nix",
+ "num_enum",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "typed-builder",
 ]
 
 [[package]]
@@ -623,20 +641,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "tokio-uring"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3ad494f39874984d990ade7f6319dafbcd3301ff0b1841f8a55a1ebb3e742c8"
-dependencies = [
- "io-uring",
- "libc",
- "scoped-tls",
- "slab",
- "socket2",
- "tokio",
 ]
 
 [[package]]

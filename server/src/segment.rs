@@ -272,6 +272,7 @@ impl OpenSegment {
     ) -> io::Result<Self> {
         let file = OpenOptions::new()
             .write(true)
+            .read(true)
             .create(true)
             .open(path)
             .await?;

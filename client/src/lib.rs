@@ -1,8 +1,8 @@
 use binrw::{BinRead, BinWrite};
 use convi::{CastFrom, ExpectFrom};
 use loglogd_api::{
-    AllocationId, AppendRequestHeader, EntryHeader, EntrySize, EntryTrailer, LogOffset,
-    ReadDataSize, ReadRequestHeader, RequestHeaderCmd, REQUEST_HEADER_SIZE,
+    AllocationId, AppendRequestHeader, EntryHeader, EntrySize, EntryTrailer, ReadDataSize,
+    ReadRequestHeader, RequestHeaderCmd, REQUEST_HEADER_SIZE,
 };
 use std::io::Cursor;
 use std::{io, net::SocketAddr};
@@ -10,6 +10,9 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::try_join;
+use tracing::{debug, trace};
+
+pub use loglogd_api::LogOffset;
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -33,7 +36,9 @@ pub struct Client {
 
 impl Client {
     pub async fn connect(server_addr: SocketAddr, log_offset: Option<LogOffset>) -> Result<Self> {
+        debug!(?server_addr, "Connecting to loglogd");
         let stream = tokio::net::TcpStream::connect(server_addr).await?;
+        trace!(?server_addr, "Connected");
 
         let (conn_read, conn_write) = tokio::io::split(stream);
 
@@ -64,6 +69,10 @@ impl Client {
 
         let header = EntryHeader::read(&mut Cursor::new(&self.buf[self.next_event_i..]))?;
 
+        let payload_start_i = self.next_event_i + EntryHeader::BYTE_SIZE;
+        let payload_end_i =
+            self.next_event_i + EntryHeader::BYTE_SIZE + usize::cast_from(header.payload_size.0);
+
         while self.bytes_available()
             < usize::expect_from(header.payload_size.0)
                 + EntryHeader::BYTE_SIZE
@@ -72,21 +81,15 @@ impl Client {
             self.fetch_more_data().await?;
         }
 
-        let trailer = EntryTrailer::read(&mut Cursor::new(&self.buf[self.next_event_i..]))?;
+        let trailer = EntryTrailer::read(&mut Cursor::new(&self.buf[payload_end_i..]))?;
 
         if !trailer.is_valid().ok_or(Error::Corrupted)? {
             return Ok(None);
         }
 
-        let payload_i = self.next_event_i + EntryHeader::BYTE_SIZE;
+        self.next_event_i = payload_end_i + EntryTrailer::BYTE_SIZE;
 
-        self.next_event_i += EntryHeader::BYTE_SIZE
-            + EntryTrailer::BYTE_SIZE
-            + usize::expect_from(header.payload_size.0);
-
-        Ok(Some(
-            &self.buf[payload_i..payload_i + self.next_event_i - EntryTrailer::BYTE_SIZE],
-        ))
+        Ok(Some(&self.buf[payload_start_i..payload_end_i]))
     }
 
     async fn fetch_header(&mut self) -> Result<()> {
@@ -155,14 +158,15 @@ impl Client {
 
     /// Does buffer have enough bytes to have a header?
     fn has_header(&mut self) -> bool {
-        self.bytes_available() <= EntryHeader::BYTE_SIZE
+        EntryHeader::BYTE_SIZE <= self.bytes_available()
     }
 
     fn bytes_available(&mut self) -> usize {
         self.buf.len() - self.next_event_i
     }
 
-    pub async fn append(&mut self, raw_entry: &[u8]) -> Result<()> {
+    pub async fn append_nocommit(&mut self, raw_entry: &[u8]) -> Result<()> {
+        debug!(size = raw_entry.len(), "Appending new entry");
         let mut cmd_buf = [0u8; REQUEST_HEADER_SIZE];
 
         let mut cursor = Cursor::new(&mut cmd_buf[0..]);
@@ -179,7 +183,7 @@ impl Client {
 
         let mut entry_log_offset_buf = [0u8; AllocationId::BYTE_SIZE];
 
-        let (offset, sent) = try_join!(
+        let (offset_res, _sent) = try_join!(
             async {
                 self.conn_read.read_exact(&mut entry_log_offset_buf).await?;
 
@@ -187,12 +191,16 @@ impl Client {
                 // TODO: in the future here we will start sending the `raw_entry` to other peers
                 // right away using `Fill` call
 
-                self.conn_read.read_u8().await?;
+                // TODO: should we have any sort of "we're done here"?
+                // self.conn_read.read_u8().await?;
                 Ok(allocation_id)
             },
             self.conn_write.write_all(&raw_entry)
         )?;
 
+        let offset = offset_res?;
+
+        debug!(offset = %offset.offset, "New entry offset");
         Ok(())
     }
 }

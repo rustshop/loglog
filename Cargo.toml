@@ -3,4 +3,5 @@ members = [
 	"api",
 	"server",
 	"client",
+	"e2e-tests",
 ]
