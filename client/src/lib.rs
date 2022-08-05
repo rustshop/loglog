@@ -76,6 +76,7 @@ impl Client {
                 RawEntry::Invalid => {
                     continue;
                 }
+                // 🤷 https://github.com/rust-lang/rust/issues/68117#issuecomment-573309675
                 RawEntry::Data(d) => unsafe { Ok(mem::transmute(d)) },
             };
         }

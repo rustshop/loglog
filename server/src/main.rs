@@ -45,7 +45,15 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let opts = Opts::from_args();
 
-    let params = Parameters::builder().db_path(opts.db_path.clone()).build();
+    let params = Parameters::builder().db_path(opts.db_path.clone());
+
+    let params = if let Some(segment_size) = opts.base_segment_file_size {
+        params.base_segment_file_size(segment_size)
+    } else {
+        params.base_segment_file_size(Parameters::DEFAULT_BASE_SEGMENT_SIZE)
+    };
+
+    let params = params.build();
 
     info!(
         listen = opts.listen.to_string(),

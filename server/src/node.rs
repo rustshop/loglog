@@ -33,11 +33,16 @@ use crate::{uring_try_rec, ConnectionError, ConnectionResult, RingConnectionResu
 /// Some parameters of runtime operation
 #[derive(TypedBuilder, Debug, Clone)]
 pub struct Parameters {
-    /// Base size that a segment file will be allocated with
-    #[builder(default = 16*1024)]
-    pub base_segment_file_size: u64,
-
+    /// Base path where segment files are stored
     pub db_path: PathBuf,
+
+    /// Base size that a segment file will be allocated with
+    #[builder(default = Parameters::DEFAULT_BASE_SEGMENT_SIZE)]
+    pub base_segment_file_size: u64,
+}
+
+impl Parameters {
+    pub const DEFAULT_BASE_SEGMENT_SIZE: u64 = 16 * 1024 * 1024;
 }
 
 /// Actively open segments
@@ -209,7 +214,7 @@ impl Node {
             open_segments: &BTreeMap<LogOffset, Arc<OpenSegment>>,
             log_offset: LogOffset,
         ) -> Option<(LogOffset, Arc<OpenSegment>)> {
-            let mut iter = open_segments.range(..log_offset);
+            let mut iter = open_segments.range(..=log_offset);
 
             if let Some(segment) = iter.next_back() {
                 // It's one of the not-last ones, we can return right away
@@ -249,6 +254,7 @@ impl Node {
                 if let Some(segment) =
                     get_segment_for_offset(&read_open_segments.inner, entry_log_offset)
                 {
+                    trace!(%entry_log_offset, ?segment, "found segment for entry write");
                     return segment;
                 }
                 // Well.. seems like we need a new one... . Record the ending offset
@@ -258,17 +264,19 @@ impl Node {
                         .last_key_value()
                         .map(|s| LastSegmentInfo {
                             start_log_offset: *s.0,
-                            end_of_allocation_log_offset: LogOffset(s.0 .0 + s.1.allocated_size),
+                            end_of_allocation_log_offset: LogOffset(
+                                s.0 .0 + s.1.allocated_size - SegmentFileHeader::BYTE_SIZE_U64,
+                            ),
                         });
                 drop(read_open_segments);
                 last_segment_info
             };
 
             let next_segment_start_log_offset = if let Some(last_segment_info) = last_segment_info {
-                // TODO: make `entries_in_flight` their own type, and make a method on that type
                 // It would be a mistake to consider current `entry_log_offset` as a beginning of
                 // next segment as we might have arrived here out of order. Instead - we can use
-                // `unwritten` to find first
+                // `unwritten` to find first unwritten entry for new segment, and thus its starting
+                // byte.
                 self.get_first_unwritten_entry_offset_ge(
                     last_segment_info.end_of_allocation_log_offset,
                 )
@@ -296,7 +304,10 @@ impl Node {
                     continue;
                 }
 
-                // Receive a new pre-written segment from pre-writer
+                // This recv while holding a write lock looks a bit meh, but
+                // for this thread to ever have to wait here, would
+                // mean that pre-allocating segments is slower than filling
+                // them with actual data.
                 let new_segment = Arc::new(
                     write_open_segments
                         .future_rx
@@ -307,11 +318,16 @@ impl Node {
                 let prev = write_open_segments
                     .inner
                     .insert(next_segment_start_log_offset, new_segment.clone());
+
                 debug_assert!(prev.is_none());
                 // we can drop the write lock already, since the segment is already usable
                 // However, we are still responsible for writing the segment file header,
                 // which pre-writer couldn't do, as it didn't know the starting log offset
                 drop(write_open_segments);
+                debug!(
+                    %next_segment_start_log_offset,
+                    ?new_segment, "opened new segment"
+                );
                 new_segment
             };
 
@@ -827,8 +843,9 @@ impl Node {
             last_fsync = Instant::now();
 
             let first_unwritten_log_offset = self.get_first_unwritten_log_offset().await;
+            let fsynced_log_offset = self.fsynced_log_offset.load(SeqCst);
 
-            if self.fsynced_log_offset.load(SeqCst) == first_unwritten_log_offset.0 {
+            if fsynced_log_offset == first_unwritten_log_offset.0 {
                 continue;
             }
 
@@ -836,9 +853,12 @@ impl Node {
                 let read_open_segments = self.open_segments.read().await;
 
                 let mut segments_iter = read_open_segments.inner.iter();
-                let first_segment = segments_iter.next().clone();
+                let first_segment = segments_iter
+                    .next()
+                    .map(|(offset, segment)| (*offset, Arc::clone(segment)));
                 let second_segment_start = segments_iter.next().map(|s| s.0).cloned();
                 drop(segments_iter);
+                drop(read_open_segments);
 
                 if let Some((first_segment_start_log_offset, first_segment)) = first_segment {
                     debug!(
@@ -870,7 +890,7 @@ impl Node {
                         {
                             let mut write_sealed_segments = self.sealed_segments.write().await;
                             write_sealed_segments.insert(
-                                *first_segment_start_log_offset,
+                                first_segment_start_log_offset,
                                 SegmentMeta {
                                     file_meta: SegmentFileMeta::new(
                                         first_segment.id,
@@ -882,7 +902,7 @@ impl Node {
                                         ),
                                     ),
                                     content_meta: segment::SegmentContentMeta {
-                                        start_log_offset: *first_segment_start_log_offset,
+                                        start_log_offset: first_segment_start_log_offset,
                                         end_log_offset: first_segment_end_log_offset,
                                     },
                                 },
@@ -893,7 +913,7 @@ impl Node {
                             let mut write_open_segments = self.open_segments.write().await;
                             let removed = write_open_segments
                                 .inner
-                                .remove(first_segment_start_log_offset);
+                                .remove(&first_segment_start_log_offset);
                             debug_assert!(removed.is_some());
                         }
                     } else {

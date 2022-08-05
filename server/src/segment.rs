@@ -257,6 +257,7 @@ impl LogStore {
     }
 }
 
+#[derive(Debug)]
 pub struct OpenSegment {
     pub id: u64,
     pub file: File,
@@ -288,7 +289,6 @@ impl OpenSegment {
                 0,
                 i64::try_from(allocated_size).expect("not fail"),
             )?;
-            // let _ = nix::unistd::lseek(fd, 0, nix::unistd::Whence::SeekSet)?;
             Ok(())
         })
         .await??;
@@ -297,9 +297,6 @@ impl OpenSegment {
             id,
             file,
             allocated_size,
-            // temporarily, to be filled later
-            // I don't feel like creating a separate type for it RN
-            // start_log_offset: LogOffset(0),
         })
     }
 
