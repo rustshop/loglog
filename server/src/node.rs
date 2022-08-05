@@ -359,7 +359,7 @@ impl Node {
         let file_path =
             self.params
                 .db_path
-                .join(format!("{:#016}{}", id, SegmentFileMeta::FILE_SUFFIX));
+                .join(format!("{:016x}{}", id, SegmentFileMeta::FILE_SUFFIX));
 
         OpenSegment::create_and_fallocate(&file_path, id, self.params.base_segment_file_size).await
     }

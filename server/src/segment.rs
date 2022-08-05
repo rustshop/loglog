@@ -15,7 +15,7 @@ use tokio_uring::{
     buf::IoBuf,
     fs::{File, OpenOptions},
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::ioutil::{file_write_all, vec_extend_to_at_least};
 
@@ -79,7 +79,7 @@ impl SegmentFileMeta {
     }
 
     pub(crate) fn get_path(db_path: &Path, id: u64) -> PathBuf {
-        let mut path = db_path.join(format!("{:#016}", id));
+        let mut path = db_path.join(format!("{:016x}", id));
         path.set_extension(SegmentFileMeta::FILE_EXTENSION);
         path
     }
@@ -216,6 +216,7 @@ impl LogStore {
         file_meta: &SegmentFileMeta,
         path: std::path::PathBuf,
     ) -> io::Result<Option<SegmentContentMeta>> {
+        trace!(path = %path.display(), "Opening sealed segment file");
         let file = std::fs::OpenOptions::new()
             .read(true)
             // just in case we need to truncate
@@ -270,16 +271,13 @@ impl OpenSegment {
         id: u64,
         allocated_size: u64,
     ) -> io::Result<Self> {
+        trace!(path = %path.display(), "Creating new segment file");
         let file = OpenOptions::new()
             .write(true)
             .read(true)
             .create(true)
             .open(path)
             .await?;
-
-        // let buf = vec![0; allocated_size as usize];
-        // let (res, buf_res) = file_write_all(&file, buf.slice(..allocated_size as usize), 0).await;
-        // res.expect("Can't fail");
 
         let fd = file.as_raw_fd();
 
@@ -371,7 +369,7 @@ impl SegmentFileMeta {
     pub const FILE_SUFFIX: &'static str = ".seg.loglog";
 
     fn file_name(&self) -> PathBuf {
-        PathBuf::from(format!("{:#016}{}", self.id, Self::FILE_SUFFIX))
+        PathBuf::from(format!("{:016x}{}", self.id, Self::FILE_SUFFIX))
     }
 }
 

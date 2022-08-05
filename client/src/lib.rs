@@ -5,10 +5,13 @@ use loglogd_api::{
     ReadRequestHeader, RequestHeaderCmd, REQUEST_HEADER_SIZE,
 };
 use std::io::Cursor;
+use std::mem;
+use std::time::Duration;
 use std::{io, net::SocketAddr};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::io::{ReadHalf, WriteHalf};
+use tokio::time::sleep;
 use tokio::try_join;
 use tracing::{debug, trace};
 
@@ -34,6 +37,12 @@ pub struct Client {
     conn_write: WriteHalf<tokio::net::TcpStream>,
 }
 
+pub enum RawEntry<'a> {
+    None,
+    Invalid,
+    Data(&'a [u8]),
+}
+
 impl Client {
     pub async fn connect(server_addr: SocketAddr, log_offset: Option<LogOffset>) -> Result<Self> {
         debug!(?server_addr, "Connecting to loglogd");
@@ -57,15 +66,30 @@ impl Client {
         })
     }
 
+    pub async fn next_raw(&mut self) -> Result<&[u8]> {
+        loop {
+            break match self.next_raw_inner().await? {
+                RawEntry::None => {
+                    sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                RawEntry::Invalid => {
+                    continue;
+                }
+                RawEntry::Data(d) => unsafe { Ok(mem::transmute(d)) },
+            };
+        }
+    }
+
     /// Return next raw entry
-    ///
-    /// This returns `None` for entries that turned out to be invalid
-    /// and should be ignored.
-    pub async fn next_raw(&mut self) -> Result<Option<&[u8]>> {
+    pub async fn next_raw_inner(&mut self) -> Result<RawEntry> {
         debug_assert!(self.next_event_i <= self.buf.len());
 
         self.maybe_compact_buf();
-        self.fetch_header().await?;
+
+        if let None = self.fetch_header().await? {
+            return Ok(RawEntry::None);
+        }
 
         let header = EntryHeader::read(&mut Cursor::new(&self.buf[self.next_event_i..]))?;
 
@@ -78,28 +102,38 @@ impl Client {
                 + EntryHeader::BYTE_SIZE
                 + EntryTrailer::BYTE_SIZE
         {
-            self.fetch_more_data().await?;
+            if self.fetch_more_data().await?.is_none() {
+                return Ok(RawEntry::None);
+            }
         }
 
         let trailer = EntryTrailer::read(&mut Cursor::new(&self.buf[payload_end_i..]))?;
 
         if !trailer.is_valid().ok_or(Error::Corrupted)? {
-            return Ok(None);
+            return Ok(RawEntry::Invalid);
         }
 
         self.next_event_i = payload_end_i + EntryTrailer::BYTE_SIZE;
 
-        Ok(Some(&self.buf[payload_start_i..payload_end_i]))
+        Ok(RawEntry::Data(&self.buf[payload_start_i..payload_end_i]))
     }
 
-    async fn fetch_header(&mut self) -> Result<()> {
+    async fn fetch_header(&mut self) -> Result<Option<()>> {
         while !self.has_header() {
-            self.fetch_more_data().await?;
+            match self.fetch_more_data().await? {
+                Some(_) => {}
+                None => return Ok(None),
+            }
         }
-        Ok(())
+        Ok(Some(()))
     }
 
-    async fn fetch_more_data(&mut self) -> Result<()> {
+    /// Fetch more data into the buffer
+    ///
+    /// Err - there was an error
+    /// Ok(None) - no more data available
+    /// OK(Some(size)) - new data loaded
+    async fn fetch_more_data(&mut self) -> Result<Option<usize>> {
         let mut cmd_buf = [0u8; REQUEST_HEADER_SIZE];
 
         let mut cursor = Cursor::new(&mut cmd_buf[0..]);
@@ -120,6 +154,11 @@ impl Client {
         self.conn_read.read_exact(&mut data_size_buf).await?;
 
         let data_size = ReadDataSize::read(&mut Cursor::new(data_size_buf.as_slice()))?.0;
+
+        if data_size == 0 {
+            return Ok(None);
+        }
+
         // TODO(perf): read into uninitialized buffer
         // https://github.com/rust-lang/rust/issues/78485
         let prev_len = self.buf.len();
@@ -142,7 +181,7 @@ impl Client {
             }
         };
 
-        Ok(())
+        Ok(Some(usize::cast_from(data_size)))
     }
 
     fn maybe_compact_buf(&mut self) {

@@ -1,8 +1,9 @@
-use std::io;
-
 use derive_more::Display;
 use error_stack::{Context, IntoReport, ResultExt};
 use loglog::{Client, LogOffset};
+use rand::Rng;
+use std::{io, time::Duration};
+use tokio::time::sleep;
 use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, Display)]
@@ -29,14 +30,16 @@ async fn main() -> AppResult<()> {
         .report()
         .change_context(AppError)?;
 
-    // client
-    //     .append_nocommit(&[1, 2, 3])
-    //     .await
-    //     .report()
-    //     .change_context(AppError)?;
+    let mut rng = rand::thread_rng();
 
     loop {
-        let entry = client.next_raw().await.report().change_context(AppError)?;
-        println!("{:?}", entry);
+        let len = rng.gen_range(0..10);
+        client
+            .append_nocommit(&(0..).take(len).collect::<Vec<u8>>())
+            .await
+            .report()
+            .change_context(AppError)?;
+
+        sleep(Duration::from_millis(rng.gen_range(0..1000))).await;
     }
 }
