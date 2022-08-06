@@ -695,7 +695,7 @@ dependencies = [
 [[package]]
 name = "tokio-uring"
 version = "0.3.0"
-source = "git+https://github.com/dpc/tokio-uring?branch=tcpstream-as-raw-fd#5fc5790d879bc32d3809450fc2d596c3901db7b9"
+source = "git+https://github.com/tokio-rs/tokio-uring"
 dependencies = [
  "io-uring",
  "libc",
