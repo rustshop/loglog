@@ -114,18 +114,26 @@ pub struct EntryWrite {
 }
 pub type ScanResult<T> = std::result::Result<T, ScanError>;
 
-pub struct LogStore;
+#[derive(Clone, Debug)]
+pub struct LogStore {
+    db_path: PathBuf,
+}
 
 impl LogStore {
+    pub fn open_or_create(db_path: PathBuf) -> io::Result<Self> {
+        std::fs::create_dir_all(&db_path)?;
+
+        Ok(Self { db_path })
+    }
+
     /// Scan `db_path` and find all the files that look like segment files.
-    pub fn scan_db_path(db_path: &Path) -> ScanResult<Vec<SegmentFileMeta>> {
-        if !db_path.is_dir() {
+    fn scan(&self) -> ScanResult<Vec<SegmentFileMeta>> {
+        if !self.db_path.is_dir() {
             Err(ScanError::NotADir)?
         }
-
         let mut segments = vec![];
 
-        for entry in std::fs::read_dir(db_path).map_err(ScanError::CanNotList)? {
+        for entry in std::fs::read_dir(&self.db_path).map_err(ScanError::CanNotList)? {
             let entry = entry?;
 
             let path = entry.path();
@@ -165,15 +173,15 @@ impl LogStore {
             segments.push(SegmentFileMeta {
                 id,
                 file_len: metadata.len(),
-                path: SegmentFileMeta::get_path(db_path, id),
+                path: SegmentFileMeta::get_path(&self.db_path, id),
             });
         }
 
         Ok(segments)
     }
 
-    pub fn load_db(db_path: &Path) -> ScanResult<Vec<SegmentMeta>> {
-        let mut files_meta = Self::scan_db_path(db_path)?;
+    pub fn load_db(&self) -> ScanResult<Vec<SegmentMeta>> {
+        let mut files_meta = self.scan()?;
 
         files_meta.sort_by_key(|meta| meta.id);
 
@@ -182,7 +190,7 @@ impl LogStore {
         // TODO: parallelize with `pariter`
         for file_meta in files_meta {
             if let Some(content_meta) =
-                Self::open_and_recover(&file_meta, db_path.join(file_meta.file_name()))?
+                Self::open_and_recover(&file_meta, self.db_path.join(file_meta.file_name()))?
             {
                 segments.push(SegmentMeta {
                     file_meta,
@@ -212,7 +220,7 @@ impl LogStore {
         Ok(segments)
     }
 
-    fn open_and_recover(
+    pub fn open_and_recover(
         file_meta: &SegmentFileMeta,
         path: std::path::PathBuf,
     ) -> io::Result<Option<SegmentContentMeta>> {

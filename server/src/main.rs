@@ -7,11 +7,9 @@ use std::io::{self};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::time::sleep;
-use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::node::Node;
-use crate::segment::LogStore;
 
 mod ioutil;
 mod node;
@@ -58,29 +56,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let params = params.build();
 
-    info!(
-        listen = opts.listen.to_string(),
-        db = opts.db_path.display().to_string(),
-        "Starting loglogd"
-    );
-    std::fs::create_dir_all(&params.db_path)?;
-
-    let segments = LogStore::load_db(&params.db_path)?;
-
-    for segments in segments.windows(2) {
-        if segments[0].content_meta.end_log_offset != segments[1].content_meta.start_log_offset {
-            panic!(
-                "offset inconsistency detected: {} {} != {} {}",
-                segments[0].file_meta.id,
-                segments[0].content_meta.end_log_offset,
-                segments[1].file_meta.id,
-                segments[1].content_meta.start_log_offset
-            );
-        }
-    }
-
     tokio_uring::start(async {
-        let _node = Node::new(opts.listen, params, segments).await?;
+        let _node = Node::new(opts.listen, params).await?;
 
         loop {
             sleep(Duration::from_secs(60)).await;

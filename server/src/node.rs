@@ -14,6 +14,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use thiserror::Error;
 use tokio::join;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::{Mutex, RwLock};
@@ -27,7 +28,8 @@ use crate::ioutil::{
     file_write_all, tcpstream_read_fill, tcpstream_write_all, vec_extend_to_at_least,
 };
 use crate::segment::{
-    self, EntryWrite, OpenSegment, SegmentFileHeader, SegmentFileMeta, SegmentMeta,
+    self, EntryWrite, LogStore, OpenSegment, ScanError, SegmentFileHeader, SegmentFileMeta,
+    SegmentMeta,
 };
 use crate::{uring_try_rec, ConnectionError, ConnectionResult, RingConnectionResult};
 
@@ -73,6 +75,7 @@ pub struct EntriesInFlight {
 
 pub struct Node {
     params: Parameters,
+
     #[allow(unused)]
     id: NodeId,
     pub term: TermId,
@@ -90,13 +93,52 @@ pub struct Node {
     fsynced_log_offset: AtomicU64,
 }
 
+#[derive(Error, Debug)]
+pub enum NodeError {
+    #[error("log store error")]
+    LogStore(#[from] ScanError),
+    #[error("io error")]
+    Io(#[from] io::Error),
+}
+
+pub type NodeResult<T> = std::result::Result<T, NodeError>;
+
 impl Node {
-    pub async fn new(
-        listen: SocketAddr,
-        params: Parameters,
-        sealed_segments: Vec<SegmentMeta>,
-    ) -> io::Result<Arc<Self>> {
-        let next_segment_id = sealed_segments
+    pub async fn new(listen: SocketAddr, params: Parameters) -> NodeResult<Arc<Self>> {
+        info!(
+            listen = %listen,
+            db = %params.db_path.display(),
+            "Starting loglogd"
+        );
+
+        let segments = tokio::task::spawn_blocking({
+            let db_path = params.db_path.clone();
+            move || -> NodeResult<Vec<SegmentMeta>> {
+                let log_store = LogStore::open_or_create(db_path)?;
+                Ok(log_store.load_db()?)
+            }
+        })
+        .await
+        .expect("log store thread panicked")?;
+
+        // TODO: what to do with this check? It should not happen if
+        // there was no data loss or bugs. Should it delete segments past
+        // the inconsistency? That risks automatic loss of data. But
+        // any data recovery issues kind of do already...
+        for segments in segments.windows(2) {
+            if segments[0].content_meta.end_log_offset != segments[1].content_meta.start_log_offset
+            {
+                panic!(
+                    "offset inconsistency detected: {} {} != {} {}",
+                    segments[0].file_meta.id,
+                    segments[0].content_meta.end_log_offset,
+                    segments[1].file_meta.id,
+                    segments[1].content_meta.start_log_offset
+                );
+            }
+        }
+
+        let next_segment_id = segments
             .last()
             .map(|segment| segment.file_meta.id + 1)
             .unwrap_or(0);
@@ -109,14 +151,14 @@ impl Node {
             entry_buffer_pool: Mutex::new(vec![]),
             params,
             entries_in_flight: RwLock::new(EntriesInFlight {
-                next_available_log_offset: sealed_segments
+                next_available_log_offset: segments
                     .last()
                     .map(|s| s.content_meta.end_log_offset)
                     .unwrap_or(LogOffset(0)),
                 unwritten: BTreeSet::new(),
             }),
             sealed_segments: RwLock::new(
-                sealed_segments
+                segments
                     .into_iter()
                     .map(|s| (s.content_meta.start_log_offset, s))
                     .collect(),
