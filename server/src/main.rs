@@ -4,9 +4,10 @@ use node::Parameters;
 use opts::Opts;
 use std::error::Error;
 use std::io::{self};
-use std::time::Duration;
 use thiserror::Error;
-use tokio::time::sleep;
+use tokio::signal;
+use tokio_uring::net::TcpListener;
+use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::node::Node;
@@ -55,14 +56,58 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let params = params.build();
+    let listen = opts.listen;
 
     tokio_uring::start(async {
-        let _node = Node::new(opts.listen, params).await?;
+        info!(
+            listen = %listen,
+            db = %params.db_path.display(),
+            "Starting loglogd"
+        );
+        info!("Listening on: {:?}", listen);
+        let listener = TcpListener::bind(listen)?;
 
-        loop {
-            sleep(Duration::from_secs(60)).await;
-        }
+        let node = Node::new(listener, params.clone()).await?;
+        let node_ctrl = node.get_ctrl();
+
+        tokio_uring::spawn(async move {
+            wait_for_shutdown_signal().await;
+            info!("signal received, starting graceful shutdown");
+            node_ctrl.stop();
+        });
+
+        let _listener = node.wait().await?;
+
+        // Workaround: for some reason finishing this `tokio-uring` scope
+        // hangs, most probably on the outstanding `accept` request on
+        // the` listener` that was `timeout`ed in the `request_handling_loop`.
+        // We don't really anything to do, so might as well terminate with success.
+        std::process::exit(0);
     })
+}
+
+async fn wait_for_shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
 
 #[derive(Error, Debug)]

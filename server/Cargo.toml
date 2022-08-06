@@ -32,3 +32,4 @@ derive_more = "0.99.17"
 loglogd-api = { path = "../api" }
 convi = { version = "0.0.4", features = [ "min_target_pointer_width_32" ] }
 atty = "*"
+scopeguard = "1.1.0"

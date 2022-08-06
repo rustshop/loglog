@@ -4,24 +4,24 @@ use loglogd_api::{
     AllocationId, AppendRequestHeader, EntryHeader, EntrySize, EntryTrailer, FillRequestHeader,
     LogOffset, NodeId, ReadDataSize, ReadRequestHeader, RequestHeaderCmd, TermId,
 };
-use std::cmp;
+use std::cmp::{self};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Cursor};
-use std::net::SocketAddr;
 use std::os::unix::prelude::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::join;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::sleep;
+use tokio::task::JoinError;
+use tokio::time::{sleep, timeout};
 use tokio_uring::buf::IoBuf;
 use tokio_uring::net::{TcpListener, TcpStream};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error as log_err, info, trace, warn};
 use typed_builder::TypedBuilder;
 
 use crate::ioutil::{
@@ -73,8 +73,11 @@ pub struct EntriesInFlight {
     unwritten: BTreeSet<LogOffset>,
 }
 
-pub struct Node {
+pub struct NodeShared {
     params: Parameters,
+
+    is_node_shutting_down: Arc<AtomicBool>,
+    is_writting_loop_done: AtomicBool,
 
     #[allow(unused)]
     id: NodeId,
@@ -88,29 +91,30 @@ pub struct Node {
 
     /// Known segments, sorted by `stream_offset`
     sealed_segments: RwLock<BTreeMap<LogOffset, SegmentMeta>>,
-    pub entry_writer_tx: Sender<EntryWrite>,
 
     fsynced_log_offset: AtomicU64,
 }
 
-#[derive(Error, Debug)]
-pub enum NodeError {
-    #[error("log store error")]
-    LogStore(#[from] ScanError),
-    #[error("io error")]
-    Io(#[from] io::Error),
+pub struct NodeCtrl {
+    is_node_shutting_down: Arc<AtomicBool>,
 }
 
-pub type NodeResult<T> = std::result::Result<T, NodeError>;
+impl NodeCtrl {
+    pub fn stop(&self) {
+        self.is_node_shutting_down.store(true, Ordering::SeqCst);
+    }
+}
+
+pub struct Node {
+    is_node_shutting_down: Arc<AtomicBool>,
+    write_loop: tokio::task::JoinHandle<()>,
+    segment_preloading_loop: tokio::task::JoinHandle<()>,
+    fsync_loop: tokio::task::JoinHandle<()>,
+    request_handling_loop: tokio::task::JoinHandle<TcpListener>,
+}
 
 impl Node {
-    pub async fn new(listen: SocketAddr, params: Parameters) -> NodeResult<Arc<Self>> {
-        info!(
-            listen = %listen,
-            db = %params.db_path.display(),
-            "Starting loglogd"
-        );
-
+    pub async fn new(listener: TcpListener, params: Parameters) -> NodeResult<Self> {
         let segments = tokio::task::spawn_blocking({
             let db_path = params.db_path.clone();
             move || -> NodeResult<Vec<SegmentMeta>> {
@@ -145,11 +149,14 @@ impl Node {
         let (entry_writer_tx, entry_writer_rx) = channel(16);
         let (future_segments_tx, future_segments_rx) = channel(4);
 
-        let node = Arc::new(Self {
+        let is_node_shutting_down = Arc::new(AtomicBool::new(false));
+        let shared = Arc::new(NodeShared {
+            is_writting_loop_done: AtomicBool::new(false),
+            is_node_shutting_down: Arc::clone(&is_node_shutting_down),
             id: NodeId(0),
             term: TermId(0),
             entry_buffer_pool: Mutex::new(vec![]),
-            params,
+            params: params.clone(),
             entries_in_flight: RwLock::new(EntriesInFlight {
                 next_available_log_offset: segments
                     .last()
@@ -167,25 +174,66 @@ impl Node {
                 inner: BTreeMap::new(),
                 future_rx: future_segments_rx,
             }),
-            entry_writer_tx,
             fsynced_log_offset: AtomicU64::new(0),
         });
 
-        info!("Listening on: {:?}", listen);
-        let listener = TcpListener::bind(listen)?;
+        Ok(Node {
+            write_loop: tokio_uring::spawn(shared.clone().run_entry_write_loop(entry_writer_rx)),
+            segment_preloading_loop: tokio_uring::spawn(
+                SegmentPreloading {
+                    params,
+                    tx: future_segments_tx,
+                }
+                .run_segment_preloading_loop(next_segment_id),
+            ),
 
-        tokio_uring::spawn(node.clone().run_entry_write_loop(entry_writer_rx));
-        tokio_uring::spawn(
-            node.clone()
-                .run_segment_preloading_loop(next_segment_id, future_segments_tx),
-        );
-
-        tokio_uring::spawn(node.clone().run_fsync_loop());
-        tokio_uring::spawn(node.clone().run_http_loop(listener));
-
-        Ok(node)
+            fsync_loop: tokio_uring::spawn(shared.clone().run_fsync_loop()),
+            request_handling_loop: tokio_uring::spawn(
+                shared
+                    .clone()
+                    .run_request_handling_loop(listener, entry_writer_tx),
+            ),
+            is_node_shutting_down,
+        })
     }
 
+    pub fn get_ctrl(&self) -> NodeCtrl {
+        NodeCtrl {
+            is_node_shutting_down: Arc::clone(&self.is_node_shutting_down),
+        }
+    }
+
+    pub async fn wait(self) -> Result<TcpListener, JoinError> {
+        let Self {
+            write_loop,
+            segment_preloading_loop,
+            fsync_loop,
+            request_handling_loop,
+            ..
+        } = self;
+
+        write_loop.await?;
+        segment_preloading_loop.await?;
+        fsync_loop.await?;
+        let res = request_handling_loop.await;
+
+        info!("Node finished");
+
+        res
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum NodeError {
+    #[error("log store error")]
+    LogStore(#[from] ScanError),
+    #[error("io error")]
+    Io(#[from] io::Error),
+}
+
+pub type NodeResult<T> = std::result::Result<T, NodeError>;
+
+impl NodeShared {
     /// Get a vector from a pool of vectors
     ///
     /// This is to avoid allocating all the time.
@@ -228,6 +276,11 @@ impl Node {
     }
 
     pub async fn run_entry_write_loop(self: Arc<Self>, mut rx: Receiver<EntryWrite>) {
+        let _guard = scopeguard::guard((), |_| {
+            info!("writting loop is done");
+            self.is_writting_loop_done.store(true, Ordering::SeqCst);
+        });
+
         while let Some(entry) = rx.recv().await {
             self.handle_entry_write(entry).await;
         }
@@ -407,46 +460,17 @@ impl Node {
         }
     }
 
-    pub async fn mark_entry_written(self: &Arc<Node>, log_offset: LogOffset) {
+    pub async fn mark_entry_written(self: &Arc<NodeShared>, log_offset: LogOffset) {
         let mut write_in_flight = self.entries_in_flight.write().await;
         let was_removed = write_in_flight.unwritten.remove(&log_offset);
         debug_assert!(was_removed);
     }
 
-    pub async fn run_segment_preloading_loop(
-        self: Arc<Self>,
-        start_id: u64,
-        tx: Sender<OpenSegment>,
-    ) {
-        let mut id = start_id;
-        loop {
-            let segment = self
-                .preload_segment_file(id)
-                .await
-                .expect("Could not preload next segment file");
-
-            id += 1;
-
-            if let Err(_e) = tx.send(segment).await {
-                // on disconnect, just finish
-                return;
-            }
-        }
-    }
-
-    async fn preload_segment_file(self: &Arc<Self>, id: u64) -> io::Result<OpenSegment> {
-        let file_path =
-            self.params
-                .db_path
-                .join(format!("{:016x}{}", id, SegmentFileMeta::FILE_SUFFIX));
-
-        OpenSegment::create_and_fallocate(&file_path, id, self.params.base_segment_file_size).await
-    }
-
     /// Handle connection
     pub async fn handle_connection(
-        self: &Arc<Node>,
+        self: &Arc<NodeShared>,
         stream: &mut TcpStream,
+        entry_writer_tx: &Sender<EntryWrite>,
     ) -> ConnectionResult<()> {
         // Header breakdown:
         // * 1B - cmd + basic args
@@ -465,7 +489,7 @@ impl Node {
         // let mut header_buf = [0u8; 14];
 
         // TODO: add timeouts?
-        loop {
+        while !self.is_node_shutting_down.load(Ordering::SeqCst) {
             let mut buf = self.pop_entry_buffer().await;
             vec_extend_to_at_least(&mut buf, 14);
 
@@ -501,7 +525,8 @@ impl Node {
                     };
                     debug!(cmd = ?cmd, args = ?args);
 
-                    self.handle_append_request(stream, buf, args.size).await?;
+                    self.handle_append_request(stream, entry_writer_tx, buf, args.size)
+                        .await?;
                 }
                 RequestHeaderCmd::Fill => {
                     let args = match FillRequestHeader::read(cursor) {
@@ -513,8 +538,14 @@ impl Node {
                     };
                     debug!(cmd = ?cmd, args = ?args);
 
-                    self.handle_fill_request(stream, buf, args.allocation_id, args.size)
-                        .await?;
+                    self.handle_fill_request(
+                        stream,
+                        entry_writer_tx,
+                        buf,
+                        args.allocation_id,
+                        args.size,
+                    )
+                    .await?;
                 }
                 RequestHeaderCmd::Read => {
                     let args = match ReadRequestHeader::read(cursor) {
@@ -532,11 +563,14 @@ impl Node {
                 RequestHeaderCmd::Other => Err(ConnectionError::Invalid)?,
             }
         }
+
+        Ok(())
     }
 
     async fn handle_append_request(
-        self: &Arc<Node>,
+        self: &Arc<NodeShared>,
         stream: &TcpStream,
+        entry_writer_tx: &Sender<EntryWrite>,
         buf: Vec<u8>,
         entry_size: EntrySize,
     ) -> ConnectionResult<()> {
@@ -545,7 +579,7 @@ impl Node {
         let mut resp_buf = self.pop_entry_buffer().await;
 
         let (fill_res, (send_res, res_buf)) = join!(
-            self.handle_fill_request(stream, buf, allocation_id, entry_size),
+            self.handle_fill_request(stream, entry_writer_tx, buf, allocation_id, entry_size),
             async {
                 debug!("Sending response to append request");
                 let res_size = AllocationId::BYTE_SIZE;
@@ -565,8 +599,9 @@ impl Node {
     }
 
     async fn handle_fill_request(
-        self: &Arc<Node>,
+        self: &Arc<NodeShared>,
         stream: &TcpStream,
+        entry_writer_tx: &Sender<EntryWrite>,
         mut buf: Vec<u8>,
         allocation_id: AllocationId,
         payload_size: EntrySize,
@@ -630,8 +665,7 @@ impl Node {
 
         // The other side should never be disconnected, but if it is,
         // we just move on without complaining.
-        let _ = self
-            .entry_writer_tx
+        let _ = entry_writer_tx
             .send(EntryWrite {
                 offset: allocation_id.offset,
                 entry: buf,
@@ -642,7 +676,7 @@ impl Node {
     }
 
     async fn write_read_response_size(
-        self: &Arc<Node>,
+        self: &Arc<NodeShared>,
         stream: &mut TcpStream,
         response_size: u32,
     ) -> ConnectionResult<()> {
@@ -658,7 +692,7 @@ impl Node {
 
     /// Send as much data (under `data_to_send` limit) from the log at `log_offset` as possible
     async fn handle_read_request_send_data(
-        self: &Arc<Node>,
+        self: &Arc<NodeShared>,
         stream: &mut TcpStream,
         log_offset: &mut LogOffset,
         num_bytes_to_send: &mut u32,
@@ -815,13 +849,13 @@ impl Node {
     }
 
     async fn handle_read_request(
-        self: &Arc<Node>,
+        self: &Arc<NodeShared>,
         stream: &mut TcpStream,
         mut log_offset: LogOffset,
         limit: ReadDataSize,
     ) -> ConnectionResult<()> {
         // TODO: change this to `commited_log_offset` when Raft is implemented
-        let last_fsynced_log_offset = LogOffset(self.fsynced_log_offset.load(SeqCst));
+        let last_fsynced_log_offset = LogOffset(self.fsynced_log_offset.load(Ordering::SeqCst));
 
         let commited_data_available = if log_offset < last_fsynced_log_offset {
             last_fsynced_log_offset.0 - log_offset.0
@@ -895,22 +929,52 @@ impl Node {
             .map(|(_, last_sealed_segment)| last_sealed_segment.content_meta.end_log_offset)
     }
 
-    pub async fn run_http_loop(self: Arc<Self>, listener: TcpListener) -> io::Result<()> {
-        loop {
-            let (mut stream, _peer_addr) = listener.accept().await?;
+    pub async fn run_request_handling_loop(
+        self: Arc<Self>,
+        listener: TcpListener,
+
+        entry_writer_tx: Sender<EntryWrite>,
+    ) -> TcpListener {
+        let _guard = scopeguard::guard((), |_| {
+            info!("request handling loop is done");
+        });
+
+        let entry_writer_tx = Arc::new(entry_writer_tx);
+
+        while !self.is_node_shutting_down.load(Ordering::Relaxed) {
+            let (mut stream, _peer_addr) =
+                // bound by a timeout, so we can exit after `is_stopped` is set in a reasonable time
+                match timeout(Duration::from_millis(500), listener.accept()).await {
+                    Ok(Ok(o)) => o,
+                    Ok(Err(e)) => {
+                        log_err!(%e, "request handling listener accept error");
+                        sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    Err(_) => {
+                        // just a timeout
+                        continue;
+                    }
+                };
 
             tokio_uring::spawn({
                 let node = self.clone();
+                let entry_writer_tx = Arc::clone(&entry_writer_tx);
                 async move {
-                    if let Err(e) = node.handle_connection(&mut stream).await {
+                    if let Err(e) = node.handle_connection(&mut stream, &entry_writer_tx).await {
                         info!("Connection error: {}", e);
                     }
                 }
             });
         }
+
+        listener
     }
 
     pub async fn run_fsync_loop(self: Arc<Self>) {
+        let _guard = scopeguard::guard((), |_| {
+            info!("fsync loop is done");
+        });
         let mut last_fsync = Instant::now();
         loop {
             let now = Instant::now();
@@ -921,9 +985,14 @@ impl Node {
             last_fsync = Instant::now();
 
             let first_unwritten_log_offset = self.get_first_unwritten_log_offset().await;
-            let fsynced_log_offset = self.fsynced_log_offset.load(SeqCst);
+            let fsynced_log_offset = self.fsynced_log_offset.load(Ordering::SeqCst);
 
             if fsynced_log_offset == first_unwritten_log_offset.0 {
+                // if we're done with all the pending work, and the writting loop
+                // is done too, we can finish
+                if self.is_writting_loop_done.load(Ordering::Relaxed) {
+                    return;
+                }
                 continue;
             }
 
@@ -1007,7 +1076,44 @@ impl Node {
             // Only after successfully looping and fsyncing and/or closing all matching segments
             // we update `last_fsynced_log_offset`
             self.fsynced_log_offset
-                .store(first_unwritten_log_offset.0, SeqCst);
+                .store(first_unwritten_log_offset.0, Ordering::SeqCst);
         }
+    }
+}
+
+struct SegmentPreloading {
+    params: Parameters,
+    tx: Sender<OpenSegment>,
+}
+
+impl SegmentPreloading {
+    pub async fn run_segment_preloading_loop(self, start_id: u64) {
+        let _guard = scopeguard::guard((), |_| {
+            info!("segment preloading loop is done");
+        });
+
+        let mut id = start_id;
+        loop {
+            let segment = self
+                .preload_segment_file(id)
+                .await
+                .expect("Could not preload next segment file");
+
+            id += 1;
+
+            if let Err(_e) = self.tx.send(segment).await {
+                // on disconnect, just finish
+                return;
+            }
+        }
+    }
+
+    async fn preload_segment_file(&self, id: u64) -> io::Result<OpenSegment> {
+        let file_path =
+            self.params
+                .db_path
+                .join(format!("{:016x}{}", id, SegmentFileMeta::FILE_SUFFIX));
+
+        OpenSegment::create_and_fallocate(&file_path, id, self.params.base_segment_file_size).await
     }
 }
