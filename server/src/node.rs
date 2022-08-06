@@ -7,6 +7,7 @@ use loglogd_api::{
 use std::cmp;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Cursor};
+use std::net::SocketAddr;
 use std::os::unix::prelude::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -14,12 +15,12 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::join;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::sleep;
 use tokio_uring::buf::IoBuf;
-use tokio_uring::net::TcpStream;
-use tracing::{debug, trace, warn};
+use tokio_uring::net::{TcpListener, TcpStream};
+use tracing::{debug, info, trace, warn};
 use typed_builder::TypedBuilder;
 
 use crate::ioutil::{
@@ -90,13 +91,19 @@ pub struct Node {
 }
 
 impl Node {
-    pub fn new(
+    pub async fn new(
+        listen: SocketAddr,
         params: Parameters,
         sealed_segments: Vec<SegmentMeta>,
-        future_segments: Receiver<OpenSegment>,
-        entry_writer_tx: Sender<EntryWrite>,
-    ) -> io::Result<Self> {
-        Ok(Self {
+    ) -> io::Result<Arc<Self>> {
+        let next_segment_id = sealed_segments
+            .last()
+            .map(|segment| segment.file_meta.id + 1)
+            .unwrap_or(0);
+        let (entry_writer_tx, entry_writer_rx) = channel(16);
+        let (future_segments_tx, future_segments_rx) = channel(4);
+
+        let node = Arc::new(Self {
             id: NodeId(0),
             term: TermId(0),
             entry_buffer_pool: Mutex::new(vec![]),
@@ -116,11 +123,25 @@ impl Node {
             ),
             open_segments: RwLock::new(OpenSegments {
                 inner: BTreeMap::new(),
-                future_rx: future_segments,
+                future_rx: future_segments_rx,
             }),
             entry_writer_tx,
             fsynced_log_offset: AtomicU64::new(0),
-        })
+        });
+
+        info!("Listening on: {:?}", listen);
+        let listener = TcpListener::bind(listen)?;
+
+        tokio_uring::spawn(node.clone().run_entry_write_loop(entry_writer_rx));
+        tokio_uring::spawn(
+            node.clone()
+                .run_segment_preloading_loop(next_segment_id, future_segments_tx),
+        );
+
+        tokio_uring::spawn(node.clone().run_fsync_loop());
+        tokio_uring::spawn(node.clone().run_http_loop(listener));
+
+        Ok(node)
     }
 
     /// Get a vector from a pool of vectors
@@ -830,6 +851,21 @@ impl Node {
             .await
             .last_key_value()
             .map(|(_, last_sealed_segment)| last_sealed_segment.content_meta.end_log_offset)
+    }
+
+    pub async fn run_http_loop(self: Arc<Self>, listener: TcpListener) -> io::Result<()> {
+        loop {
+            let (mut stream, _peer_addr) = listener.accept().await?;
+
+            tokio_uring::spawn({
+                let node = self.clone();
+                async move {
+                    if let Err(e) = node.handle_connection(&mut stream).await {
+                        info!("Connection error: {}", e);
+                    }
+                }
+            });
+        }
     }
 
     pub async fn run_fsync_loop(self: Arc<Self>) {

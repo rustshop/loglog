@@ -4,10 +4,9 @@ use node::Parameters;
 use opts::Opts;
 use std::error::Error;
 use std::io::{self};
-use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::mpsc::channel;
-use tokio_uring::net::TcpListener;
+use tokio::time::sleep;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -80,42 +79,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let next_segment_id = segments
-        .last()
-        .map(|segment| segment.file_meta.id + 1)
-        .unwrap_or(0);
-    let (entry_write_tx, _entry_write_rx) = channel(16);
-    let (_future_segments_tx, future_segments_rx) = channel(4);
-    let node = Arc::new(Node::new(
-        params,
-        segments,
-        future_segments_rx,
-        entry_write_tx,
-    )?);
-
     tokio_uring::start(async {
-        // TODO: move these into `impl Node` somewhere?
-        tokio_uring::spawn(node.clone().run_entry_write_loop(_entry_write_rx));
-        tokio_uring::spawn(
-            node.clone()
-                .run_segment_preloading_loop(next_segment_id, _future_segments_tx),
-        );
-
-        tokio_uring::spawn(node.clone().run_fsync_loop());
-        let listener = TcpListener::bind(opts.listen)?;
-        info!("Listening on: {}", opts.listen);
+        let _node = Node::new(opts.listen, params, segments).await?;
 
         loop {
-            let (mut stream, _peer_addr) = listener.accept().await?;
-
-            tokio_uring::spawn({
-                let node = node.clone();
-                async move {
-                    if let Err(e) = node.handle_connection(&mut stream).await {
-                        info!("Connection error: {}", e);
-                    }
-                }
-            });
+            sleep(Duration::from_secs(60)).await;
         }
     })
 }
