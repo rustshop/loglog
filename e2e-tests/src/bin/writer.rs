@@ -3,7 +3,14 @@ use derive_more::Display;
 use error_stack::{Context, IntoReport, Report, ResultExt};
 use loglog::{Client, LogOffset};
 use rand::{prelude::StdRng, Rng, SeedableRng};
-use std::{io, time::Duration};
+use std::{
+    io,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, SystemTime},
+};
 use tokio::time::sleep;
 use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
 
@@ -28,12 +35,22 @@ pub struct Opts {
 
     #[clap(long = "entry-size", default_value = "10")]
     pub entry_size: usize,
+
+    #[clap(long)]
+    pub commit: bool,
 }
 
 impl Opts {
     pub fn from_args() -> Self {
         Opts::parse()
     }
+}
+
+fn now_ts() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("must not fail")
+        .as_secs()
 }
 #[tokio::main]
 async fn main() -> AppResult<()> {
@@ -48,7 +65,10 @@ async fn main() -> AppResult<()> {
 
     let mut join: Vec<tokio::task::JoinHandle<Result<(), Report<AppError>>>> = vec![];
 
+    let last_offset_print_ts = Arc::new(AtomicU64::new(now_ts()));
+
     for _ in 0..opts.threads {
+        let last_offset_print_ts = Arc::clone(&last_offset_print_ts);
         join.push(tokio::spawn(async move {
             let mut rng = StdRng::from_entropy();
             let entry_buf = (0..)
@@ -63,11 +83,28 @@ async fn main() -> AppResult<()> {
 
             loop {
                 let len = rng.gen_range(0..opts.entry_size);
-                client
-                    .append_nocommit(&entry_buf[0..len])
-                    .await
-                    .report()
-                    .change_context(AppError)?;
+
+                let offset = if opts.commit {
+                    client
+                        .append(&entry_buf[0..len])
+                        .await
+                        .report()
+                        .change_context(AppError)?
+                } else {
+                    client
+                        .append_nocommit(&entry_buf[0..len])
+                        .await
+                        .report()
+                        .change_context(AppError)?
+                };
+
+                let ts = now_ts();
+
+                let prev_ts = last_offset_print_ts.swap(ts, Ordering::SeqCst);
+
+                if ts != prev_ts {
+                    println!("{}", offset);
+                }
 
                 if opts.delay != 0 {
                     sleep(Duration::from_millis(rng.gen_range(0..opts.delay))).await;
