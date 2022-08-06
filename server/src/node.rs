@@ -277,21 +277,23 @@ impl Node {
                 // next segment as we might have arrived here out of order. Instead - we can use
                 // `unwritten` to find first unwritten entry for new segment, and thus its starting
                 // byte.
-                self.get_first_unwritten_entry_offset_ge(
-                    last_segment_info.end_of_allocation_log_offset,
-                )
-                .await
-                .expect("at very least this entry should be in `unwritten`")
-            } else {
-                self.get_sealed_segments_end_log_offset()
+                dbg!(self
+                    .get_first_unwritten_entry_offset_ge(
+                        last_segment_info.end_of_allocation_log_offset,
+                    )
                     .await
-                    .unwrap_or(LogOffset(0))
+                    .expect("at very least this entry should be in `unwritten`"))
+            } else {
+                dbg!(self
+                    .get_sealed_segments_end_log_offset()
+                    .await
+                    .unwrap_or(LogOffset(0)))
             };
 
             // It wasn't one of the existing open segments, so we drop the lock fo reading
             // so potentially other threads can make write their stuff, and try to switch
             // to writes.
-            let new_segment = {
+            let (new_segment_start_log_offset, new_segment) = {
                 let mut write_open_segments = self.open_segments.write().await;
 
                 // Check again if we still need to create new open segment. Things might have changed between unlock & write lock - some
@@ -328,12 +330,12 @@ impl Node {
                     %next_segment_start_log_offset,
                     ?new_segment, "opened new segment"
                 );
-                new_segment
+                (next_segment_start_log_offset, new_segment)
             };
 
             self.put_entry_buffer(
                 new_segment
-                    .write_header(entry_log_offset, self.pop_entry_buffer().await)
+                    .write_header(new_segment_start_log_offset, self.pop_entry_buffer().await)
                     .await,
             )
             .await;
