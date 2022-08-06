@@ -40,7 +40,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
         ))
-        .with(tracing_subscriber::fmt::layer().with_writer(io::stderr))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(atty::is(atty::Stream::Stderr))
+                .with_writer(io::stderr),
+        )
         .init();
 
     let opts = Opts::from_args();
@@ -63,6 +67,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     std::fs::create_dir_all(&params.db_path)?;
 
     let segments = LogStore::load_db(&params.db_path)?;
+
+    for segments in segments.windows(2) {
+        if segments[0].content_meta.end_log_offset != segments[1].content_meta.start_log_offset {
+            panic!(
+                "offset inconsistency detected: {} {} != {} {}",
+                segments[0].file_meta.id,
+                segments[0].content_meta.end_log_offset,
+                segments[1].file_meta.id,
+                segments[1].content_meta.start_log_offset
+            );
+        }
+    }
 
     let next_segment_id = segments
         .last()

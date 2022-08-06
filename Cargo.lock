@@ -248,6 +248,7 @@ dependencies = [
 name = "loglogd"
 version = "0.1.0"
 dependencies = [
+ "atty",
  "binrw",
  "clap",
  "convi 0.0.4",

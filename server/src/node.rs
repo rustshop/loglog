@@ -277,17 +277,15 @@ impl Node {
                 // next segment as we might have arrived here out of order. Instead - we can use
                 // `unwritten` to find first unwritten entry for new segment, and thus its starting
                 // byte.
-                dbg!(self
-                    .get_first_unwritten_entry_offset_ge(
-                        last_segment_info.end_of_allocation_log_offset,
-                    )
-                    .await
-                    .expect("at very least this entry should be in `unwritten`"))
+                self.get_first_unwritten_entry_offset_ge(
+                    last_segment_info.end_of_allocation_log_offset,
+                )
+                .await
+                .expect("at very least this entry should be in `unwritten`")
             } else {
-                dbg!(self
-                    .get_sealed_segments_end_log_offset()
+                self.get_sealed_segments_end_log_offset()
                     .await
-                    .unwrap_or(LogOffset(0)))
+                    .unwrap_or(LogOffset(0))
             };
 
             // It wasn't one of the existing open segments, so we drop the lock fo reading

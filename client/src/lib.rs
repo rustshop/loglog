@@ -37,10 +37,10 @@ pub struct Client {
     conn_write: WriteHalf<tokio::net::TcpStream>,
 }
 
-pub enum RawEntry<'a> {
+pub enum ReadData<T> {
     None,
     Invalid,
-    Data(&'a [u8]),
+    Some(T),
 }
 
 impl Client {
@@ -68,28 +68,28 @@ impl Client {
 
     pub async fn next_raw(&mut self) -> Result<&[u8]> {
         loop {
-            break match self.next_raw_inner().await? {
-                RawEntry::None => {
+            match self.next_raw_inner().await? {
+                ReadData::None => {
                     sleep(Duration::from_secs(1)).await;
                     continue;
                 }
-                RawEntry::Invalid => {
+                ReadData::Invalid => {
                     continue;
                 }
                 // 🤷 https://github.com/rust-lang/rust/issues/68117#issuecomment-573309675
-                RawEntry::Data(d) => unsafe { Ok(mem::transmute(d)) },
+                ReadData::Some(d) => return unsafe { Ok(mem::transmute(d)) },
             };
         }
     }
 
     /// Return next raw entry
-    pub async fn next_raw_inner(&mut self) -> Result<RawEntry> {
+    pub async fn next_raw_inner(&mut self) -> Result<ReadData<&'_ [u8]>> {
         debug_assert!(self.next_event_i <= self.buf.len());
 
         self.maybe_compact_buf();
 
         if let None = self.fetch_header().await? {
-            return Ok(RawEntry::None);
+            return Ok(ReadData::None);
         }
 
         let header = EntryHeader::read(&mut Cursor::new(&self.buf[self.next_event_i..]))?;
@@ -104,19 +104,19 @@ impl Client {
                 + EntryTrailer::BYTE_SIZE
         {
             if self.fetch_more_data().await?.is_none() {
-                return Ok(RawEntry::None);
+                return Ok(ReadData::None);
             }
         }
 
         let trailer = EntryTrailer::read(&mut Cursor::new(&self.buf[payload_end_i..]))?;
 
         if !trailer.is_valid().ok_or(Error::Corrupted)? {
-            return Ok(RawEntry::Invalid);
+            return Ok(ReadData::Invalid);
         }
 
         self.next_event_i = payload_end_i + EntryTrailer::BYTE_SIZE;
 
-        Ok(RawEntry::Data(&self.buf[payload_start_i..payload_end_i]))
+        Ok(ReadData::Some(&self.buf[payload_start_i..payload_end_i]))
     }
 
     async fn fetch_header(&mut self) -> Result<Option<()>> {
@@ -129,12 +129,16 @@ impl Client {
         Ok(Some(()))
     }
 
-    /// Fetch more data into the buffer
+    /// Send a read command to the server, read back the response size
     ///
-    /// Err - there was an error
-    /// Ok(None) - no more data available
-    /// OK(Some(size)) - new data loaded
-    async fn fetch_more_data(&mut self) -> Result<Option<usize>> {
+    /// Returns number of bytes the server is going to send
+    /// over through the `read`
+    async fn send_read_cmd(
+        mut read: impl AsyncReadExt + Unpin,
+        mut write: impl AsyncWriteExt + Unpin,
+        log_offset: LogOffset,
+        limit: u32,
+    ) -> Result<u32> {
         let mut cmd_buf = [0u8; REQUEST_HEADER_SIZE];
 
         let mut cursor = Cursor::new(&mut cmd_buf[0..]);
@@ -143,18 +147,35 @@ impl Client {
             .expect("can't fail");
 
         let args = ReadRequestHeader {
-            offset: self.log_offset,
-            limit: ReadDataSize(1024 * 64),
+            offset: log_offset,
+            limit: ReadDataSize(limit),
         };
 
         args.write_to(&mut cursor).expect("can't fail");
-        self.conn_write.write_all(&cmd_buf).await?;
+        write.write_all(&cmd_buf).await?;
 
         let mut data_size_buf = [0u8; ReadDataSize::BYTE_SIZE];
 
-        self.conn_read.read_exact(&mut data_size_buf).await?;
+        read.read_exact(&mut data_size_buf).await?;
 
         let data_size = ReadDataSize::read(&mut Cursor::new(data_size_buf.as_slice()))?.0;
+
+        Ok(data_size)
+    }
+
+    /// Fetch more data into the buffer
+    ///
+    /// Err - there was an error
+    /// Ok(None) - no more data available
+    /// OK(Some(size)) - new data loaded
+    async fn fetch_more_data(&mut self) -> Result<Option<usize>> {
+        let data_size = Self::send_read_cmd(
+            &mut self.conn_read,
+            &mut self.conn_write,
+            self.log_offset,
+            1024 * 64,
+        )
+        .await?;
 
         if data_size == 0 {
             return Ok(None);
@@ -205,7 +226,7 @@ impl Client {
         self.buf.len() - self.next_event_i
     }
 
-    pub async fn append_nocommit(&mut self, raw_entry: &[u8]) -> Result<()> {
+    pub async fn append_nocommit(&mut self, raw_entry: &[u8]) -> Result<LogOffset> {
         debug!(size = raw_entry.len(), "Appending new entry");
         let mut cmd_buf = [0u8; REQUEST_HEADER_SIZE];
 
@@ -241,6 +262,45 @@ impl Client {
         let offset = offset_res?;
 
         debug!(offset = %offset.offset, "New entry offset");
-        Ok(())
+        Ok(offset.offset)
+    }
+
+    pub async fn append(&mut self, raw_entry: &[u8]) -> Result<LogOffset> {
+        let offset = self.append_nocommit(raw_entry).await?;
+        loop {
+            match self.append_read_commit(offset).await? {
+                ReadData::None => {
+                    sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                ReadData::Invalid => {
+                    // we are actually not reading the whole entry, so we
+                    // are not checking if the written entry is valid. It
+                    // should be - if we returned any IO errors, we wouldn't be
+                    // here.
+                    unreachable!();
+                }
+                // 🤷 https://github.com/rust-lang/rust/issues/68117#issuecomment-573309675
+                ReadData::Some(offset) => return Ok(offset),
+            };
+        }
+    }
+
+    /// Wait for the server to commit to the written entry
+    ///
+    /// We use the offset returned for the allocated entry and
+    /// just need to
+    pub async fn append_read_commit(&mut self, offset: LogOffset) -> Result<ReadData<LogOffset>> {
+        let data_size =
+            Self::send_read_cmd(&mut self.conn_read, &mut self.conn_write, offset, 1).await?;
+
+        if data_size == 0 {
+            return Ok(ReadData::None);
+        }
+        debug_assert_eq!(data_size, 1);
+        // read that one byte out
+        self.conn_read.read_u8().await?;
+
+        Ok(ReadData::Some(offset))
     }
 }
