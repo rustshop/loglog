@@ -511,8 +511,11 @@ impl NodeShared {
         let mut last_fsync = Instant::now();
         loop {
             let now = Instant::now();
+            // TODO: turn into sleeping each time there's nothing more
+            // to fsync, by waiting on a `watch::Receiver`?
+            // Need to do some more perf analysis on this one.
             let till_next_fsync =
-                Duration::from_millis(300).saturating_sub(now.duration_since(last_fsync));
+                Duration::from_millis(10).saturating_sub(now.duration_since(last_fsync));
 
             sleep(till_next_fsync).await;
             last_fsync = Instant::now();
@@ -610,6 +613,10 @@ impl NodeShared {
             // we update `last_fsynced_log_offset`
             self.fsynced_log_offset
                 .store(first_unwritten_log_offset.0, Ordering::SeqCst);
+            // we don't care if everyone disconnected
+            let _ = self
+                .last_fsynced_log_offset_tx
+                .send(first_unwritten_log_offset);
         }
     }
 }
@@ -1091,26 +1098,44 @@ impl RequestHandler {
         limit: ReadDataSize,
     ) -> ConnectionResult<()> {
         // TODO: change this to `commited_log_offset` when Raft is implemented
-        let last_fsynced_log_offset =
-            LogOffset(self.shared.fsynced_log_offset.load(Ordering::SeqCst));
+        let mut last_fsynced_log_offset_rx = self.last_fsynced_log_offset_rx.clone();
 
-        let commited_data_available = if log_offset < last_fsynced_log_offset {
-            last_fsynced_log_offset.0 - log_offset.0
-        } else {
-            0
+        let mut retry = 0;
+
+        let mut num_bytes_to_send = loop {
+            let last_fsynced_log_offset = *last_fsynced_log_offset_rx.borrow_and_update();
+
+            let commited_data_available = if log_offset < last_fsynced_log_offset {
+                last_fsynced_log_offset.0 - log_offset.0
+            } else {
+                0
+            };
+
+            let num_bytes_to_send =
+                u32::expect_from(cmp::min(u64::from(limit.0), commited_data_available));
+
+            trace!(
+                %last_fsynced_log_offset,
+                commited_data_available,
+                %log_offset,
+                limit = limit.0,
+                num_bytes_to_send,
+                "read request"
+            );
+
+            if num_bytes_to_send == 0 {
+                retry += 1;
+
+                if 10 < retry {
+                    break num_bytes_to_send;
+                }
+                // ignore errors
+                let _ = last_fsynced_log_offset_rx.changed().await;
+            } else {
+                break num_bytes_to_send;
+            }
         };
 
-        let mut num_bytes_to_send =
-            u32::expect_from(cmp::min(u64::from(limit.0), commited_data_available));
-
-        trace!(
-            %last_fsynced_log_offset,
-            commited_data_available,
-            %log_offset,
-            limit = limit.0,
-            num_bytes_to_send,
-            "read request"
-        );
         self.write_read_response_size(stream, num_bytes_to_send)
             .await?;
 
@@ -1123,8 +1148,6 @@ impl RequestHandler {
             self.handle_read_request_send_data(stream, &mut log_offset, &mut num_bytes_to_send)
                 .await?;
             trace!(
-                %last_fsynced_log_offset,
-                commited_data_available,
                 %log_offset,
                 limit = limit.0,
                 num_bytes_to_send,
