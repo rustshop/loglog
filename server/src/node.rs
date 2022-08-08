@@ -1,3 +1,4 @@
+use self::segment_preloading::*;
 use crate::ioutil::file_write_all;
 use crate::segment::{
     self, EntryWrite, LogStore, OpenSegment, ScanError, SegmentFileHeader, SegmentFileMeta,
@@ -12,15 +13,15 @@ use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::{channel, Receiver};
 use tokio::sync::{watch, Mutex, RwLock};
 use tokio::task::JoinError;
 use tokio_uring::buf::IoBuf;
 use tokio_uring::net::TcpListener;
 use tracing::{debug, info, trace, warn};
 use typed_builder::TypedBuilder;
-
 mod request_handling;
+mod segment_preloading;
 
 /// Some parameters of runtime operation
 #[derive(TypedBuilder, Debug, Clone)]
@@ -624,42 +625,5 @@ impl NodeShared {
                 .last_fsynced_log_offset_tx
                 .send(first_unwritten_log_offset);
         }
-    }
-}
-
-struct SegmentPreloading {
-    params: Parameters,
-    tx: Sender<OpenSegment>,
-}
-
-impl SegmentPreloading {
-    pub async fn run_segment_preloading_loop(self, start_id: u64) {
-        let _guard = scopeguard::guard((), |_| {
-            info!("segment preloading loop is done");
-        });
-
-        let mut id = start_id;
-        loop {
-            let segment = self
-                .preload_segment_file(id)
-                .await
-                .expect("Could not preload next segment file");
-
-            id += 1;
-
-            if let Err(_e) = self.tx.send(segment).await {
-                // on disconnect, just finish
-                return;
-            }
-        }
-    }
-
-    async fn preload_segment_file(&self, id: u64) -> io::Result<OpenSegment> {
-        let file_path =
-            self.params
-                .db_path
-                .join(format!("{:016x}{}", id, SegmentFileMeta::FILE_SUFFIX));
-
-        OpenSegment::create_and_fallocate(&file_path, id, self.params.base_segment_file_size).await
     }
 }
