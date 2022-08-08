@@ -6,7 +6,7 @@ use loglogd_api::{
 };
 use std::io::Cursor;
 use std::mem;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{io, net::SocketAddr};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -268,9 +268,14 @@ impl Client {
     pub async fn append(&mut self, raw_entry: &[u8]) -> Result<LogOffset> {
         let offset = self.append_nocommit(raw_entry).await?;
         loop {
+            let read_start = Instant::now();
             match self.append_read_commit(offset).await? {
                 ReadData::None => {
-                    sleep(Duration::from_secs(1)).await;
+                    let read_duration = read_start.elapsed();
+                    let min_read_duration = Duration::from_secs(1);
+                    if read_duration < min_read_duration {
+                        sleep(min_read_duration - read_duration).await;
+                    }
                     continue;
                 }
                 ReadData::Invalid => {
