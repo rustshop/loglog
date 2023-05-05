@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let opts = Opts::from_args();
 
-    let params = Parameters::builder().db_path(opts.db_path.clone());
+    let params = Parameters::builder().db_path(opts.data_dir.clone());
 
     let params = if let Some(segment_size) = opts.base_segment_file_size {
         params.base_segment_file_size(segment_size)
@@ -60,7 +60,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     tokio_uring::start(async {
         info!(
             listen = %listen,
-            db = %params.db_path.display(),
+            "data-dir" = %params.db_path.display(),
             "Starting loglogd"
         );
         info!("Listening on: {:?}", listen);

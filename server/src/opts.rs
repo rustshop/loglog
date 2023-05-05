@@ -5,8 +5,8 @@ use std::{net::SocketAddr, path::PathBuf};
 
 #[derive(Parser, Debug, Clone)]
 pub struct Opts {
-    #[clap(long = "db-path", default_value = "/var/loglog")]
-    pub db_path: PathBuf,
+    #[clap(long = "data-dir", default_value = "/var/lib/loglogd")]
+    pub data_dir: PathBuf,
 
     #[clap(long = "listen", default_value = "127.0.0.1:8080")]
     pub listen: SocketAddr,
