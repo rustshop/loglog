@@ -3,7 +3,7 @@ use std::io;
 use tokio::sync::mpsc;
 use tracing::info;
 
-use crate::segment::{OpenSegment, SegmentFileMeta};
+use crate::segment::{OpenSegment, SegmentFileMeta, SegmentId};
 
 use super::Parameters;
 
@@ -13,7 +13,7 @@ pub struct SegmentPreloading {
 }
 
 impl SegmentPreloading {
-    pub async fn run_segment_preloading_loop(self, start_id: u64) {
+    pub async fn run_segment_preloading_loop(self, start_id: SegmentId) {
         let _guard = scopeguard::guard((), |_| {
             info!("segment preloading loop is done");
         });
@@ -25,7 +25,7 @@ impl SegmentPreloading {
                 .await
                 .expect("Could not preload next segment file");
 
-            id += 1;
+            id = id.next();
 
             if let Err(_e) = self.tx.send(segment).await {
                 // on disconnect, just finish
@@ -34,11 +34,12 @@ impl SegmentPreloading {
         }
     }
 
-    async fn preload_segment_file(&self, id: u64) -> io::Result<OpenSegment> {
-        let file_path =
-            self.params
-                .db_path
-                .join(format!("{:016x}{}", id, SegmentFileMeta::FILE_SUFFIX));
+    async fn preload_segment_file(&self, id: SegmentId) -> io::Result<OpenSegment> {
+        let file_path = self.params.data_dir.join(format!(
+            "{:016x}{}",
+            id.as_u64(),
+            SegmentFileMeta::FILE_SUFFIX
+        ));
 
         OpenSegment::create_and_fallocate(&file_path, id, self.params.base_segment_file_size).await
     }

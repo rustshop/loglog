@@ -84,6 +84,7 @@
                 pkgs.rust-analyzer
                 pkgs.rustc
                 pkgs.cargo
+                pkgs.clippy
 
                 # Lints
                 pkgs.rustfmt

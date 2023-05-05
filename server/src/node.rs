@@ -7,7 +7,7 @@ use crate::segment::{
 use loglogd_api::{AllocationId, EntryHeader, EntrySize, EntryTrailer, LogOffset, NodeId, TermId};
 use request_handling::*;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{self};
+use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -27,7 +27,7 @@ mod segment_preloading;
 #[derive(TypedBuilder, Debug, Clone)]
 pub struct Parameters {
     /// Base path where segment files are stored
-    pub db_path: PathBuf,
+    pub data_dir: PathBuf,
 
     /// Base size that a segment file will be allocated with
     #[builder(default = Parameters::DEFAULT_BASE_SEGMENT_SIZE)]
@@ -109,9 +109,9 @@ pub struct Node {
 impl Node {
     pub async fn new(listener: TcpListener, params: Parameters) -> NodeResult<Self> {
         let segments = tokio::task::spawn_blocking({
-            let db_path = params.db_path.clone();
+            let data_dir = params.data_dir.clone();
             move || -> NodeResult<Vec<SegmentMeta>> {
-                let log_store = LogStore::open_or_create(db_path)?;
+                let log_store = LogStore::open_or_create(data_dir)?;
                 Ok(log_store.load_db()?)
             }
         })
@@ -137,8 +137,8 @@ impl Node {
 
         let next_segment_id = segments
             .last()
-            .map(|segment| segment.file_meta.id + 1)
-            .unwrap_or(0);
+            .map(|segment| segment.file_meta.id.next())
+            .unwrap_or_default();
         let (entry_writer_tx, entry_writer_rx) = channel(16);
         let (future_segments_tx, future_segments_rx) = channel(4);
         let (last_fsynced_log_offset_tx, last_fsynced_log_offset_rx) = watch::channel(LogOffset(0));
@@ -320,7 +320,7 @@ impl NodeShared {
         debug!(
             offset = offset.0,
             size = entry.len(),
-            segment_id = segment.id,
+            segment_id = %segment.id,
             segment_offset = file_offset,
             "Writing entry to segment"
         );
@@ -552,7 +552,7 @@ impl NodeShared {
 
                 if let Some((first_segment_start_log_offset, first_segment)) = first_segment {
                     debug!(
-                        segment_id = first_segment.id,
+                        segment_id = %first_segment.id,
                         segment_start_log_offset = first_segment_start_log_offset.0,
                         first_unwritten_log_offset = first_unwritten_log_offset.0,
                         "fsync"
@@ -587,7 +587,7 @@ impl NodeShared {
                                         first_segment_offset_size
                                             + SegmentFileHeader::BYTE_SIZE_U64,
                                         SegmentFileMeta::get_path(
-                                            &self.params.db_path,
+                                            &self.params.data_dir,
                                             first_segment.id,
                                         ),
                                     ),

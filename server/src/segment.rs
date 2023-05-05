@@ -1,13 +1,11 @@
 use std::{
+    fmt,
     io::{BufReader, Cursor, Seek},
     os::unix::prelude::AsRawFd,
     path::{Path, PathBuf},
 };
 
-use binrw::{
-    io::{self},
-    BinRead, BinWrite,
-};
+use binrw::{io, BinRead, BinWrite};
 use loglogd_api::{EntryHeader, EntryTrailer, LogOffset};
 use nix::{fcntl::FallocateFlags, unistd::ftruncate};
 use thiserror::Error;
@@ -58,6 +56,32 @@ pub struct SegmentMeta {
     pub content_meta: SegmentContentMeta,
 }
 
+/// A sequential number (id) of a segment file
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SegmentId(u64);
+
+impl SegmentId {
+    #[must_use]
+    pub fn next(&self) -> Self {
+        Self(self.0 + 1)
+    }
+
+    pub fn as_u64(&self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for SegmentId {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl fmt::Display for SegmentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
 /// Segment metadata
 ///
 /// Basically everything we can figure out about segment file
@@ -65,27 +89,37 @@ pub struct SegmentMeta {
 #[derive(Clone, Debug)]
 pub struct SegmentFileMeta {
     // Segments are sequentially numbered and `id` used to create their name
-    pub id: u64,
+    pub id: SegmentId,
 
-    /// Path to a file, to avoid redoing (allocating)
-    pub path: PathBuf,
+    /// Path to a segment file, to avoid allocating to calculate it during normal operations
+    path: PathBuf,
 
+    /// File length
     pub file_len: u64,
 }
 
 impl SegmentFileMeta {
-    pub fn new(id: u64, file_len: u64, path: PathBuf) -> Self {
-        Self { id, file_len, path }
+    pub fn new(id: impl Into<SegmentId>, file_len: u64, path: PathBuf) -> Self {
+        Self {
+            id: id.into(),
+            file_len,
+            path,
+        }
     }
 
-    pub(crate) fn get_path(db_path: &Path, id: u64) -> PathBuf {
-        let mut path = db_path.join(format!("{:016x}", id));
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Calculate path for a segment file of a given id
+    pub(crate) fn get_path(db_path: &Path, id: SegmentId) -> PathBuf {
+        let mut path = db_path.join(format!("{:016x}", id.0));
         path.set_extension(SegmentFileMeta::FILE_EXTENSION);
         path
     }
 }
 
-/// Data about segment content from the file content itself (mostly header)
+/// Metadata about segment file content, from the segment file content itself (mostly header)
 #[derive(Debug, Copy, Clone)]
 pub struct SegmentContentMeta {
     /// The starting byte of the stream this segment holds.
@@ -166,9 +200,11 @@ impl LogStore {
                 })?;
             }
 
-            let id = u64::from_str_radix(&id_str, 16).map_err(|_| ScanError::InvalidFilePath {
-                path: path.to_owned(),
-            })?;
+            let id = u64::from_str_radix(&id_str, 16)
+                .map_err(|_| ScanError::InvalidFilePath {
+                    path: path.to_owned(),
+                })?
+                .into();
 
             segments.push(SegmentFileMeta {
                 id,
@@ -209,9 +245,9 @@ impl LogStore {
             let last = segments.last().expect("not empty");
             info!(
                 start_pos = first.content_meta.start_log_offset.0,
-                start_segment = first.file_meta.id,
+                start_segment = %first.file_meta.id,
                 end_post = last.content_meta.end_log_offset.0,
-                end_segment = last.file_meta.id,
+                end_segment = %last.file_meta.id,
                 num_segments = segments.len(),
                 "Segments loaded"
             );
@@ -267,7 +303,7 @@ impl LogStore {
 
 #[derive(Debug)]
 pub struct OpenSegment {
-    pub id: u64,
+    pub id: SegmentId,
     pub file: File,
     pub allocated_size: u64,
     // The position in the stream of the first entry stored in this file
@@ -277,7 +313,7 @@ pub struct OpenSegment {
 impl OpenSegment {
     pub async fn create_and_fallocate(
         path: &Path,
-        id: u64,
+        id: SegmentId,
         allocated_size: u64,
     ) -> io::Result<Self> {
         trace!(path = %path.display(), "Creating new segment file");
@@ -374,7 +410,7 @@ impl SegmentFileMeta {
     pub const FILE_SUFFIX: &'static str = ".seg.loglog";
 
     fn file_name(&self) -> PathBuf {
-        PathBuf::from(format!("{:016x}{}", self.id, Self::FILE_SUFFIX))
+        PathBuf::from(format!("{:016x}{}", self.id.as_u64(), Self::FILE_SUFFIX))
     }
 }
 

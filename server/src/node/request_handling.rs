@@ -318,7 +318,7 @@ impl RequestHandler {
 
             let (segment_start_log_offset, segment) =
                 if let Some(segment) = read_sealed_segments.range(..=*log_offset).next_back() {
-                    (segment.0.clone(), segment.1.clone())
+                    (*segment.0, segment.1.clone())
                 } else {
                     // if we couldn't find any segments below `log_offset`, that must
                     // mean there are no sealed segments at all, otherwise there wouldn't
@@ -333,7 +333,7 @@ impl RequestHandler {
                 break;
             }
             // TODO(perf): allocates
-            let path = segment.file_meta.path.clone();
+            let path = segment.file_meta.path();
             drop(read_sealed_segments);
 
             debug_assert!(segment_start_log_offset <= *log_offset);
@@ -356,7 +356,7 @@ impl RequestHandler {
                     trace!(
                         bytes_to_send,
                         file_offset,
-                        segment_id = segment.file_meta.id,
+                        segment_id = %segment.file_meta.id,
                         "sending sealed segment data"
                     );
                     let mut file_offset_mut: i64 = i64::expect_from(file_offset);
@@ -379,7 +379,7 @@ impl RequestHandler {
             })
             .await??;
             *num_bytes_to_send -= u32::expect_from(bytes_written_total);
-            log_offset.0 += u64::from(bytes_written_total);
+            log_offset.0 += bytes_written_total;
         }
 
         // if more data is still needed, it's probably in the still opened buffers
@@ -388,7 +388,7 @@ impl RequestHandler {
 
             let (segment_start_log_offset, segment) =
                 if let Some(segment) = read_open_segments.inner.range(..=*log_offset).next_back() {
-                    (segment.0.clone(), segment.1.clone())
+                    (*segment.0, segment.1.clone())
                 } else {
                     // This means we couldn't find a matching open segment. This
                     // must be because we missed a segment that was moved between
@@ -435,7 +435,7 @@ impl RequestHandler {
                     trace!(
                         bytes_to_send,
                         file_offset,
-                        segment_id,
+                        %segment_id,
                         "sending open segment data"
                     );
                     let mut file_offset_mut: i64 = i64::expect_from(file_offset);
@@ -458,7 +458,7 @@ impl RequestHandler {
             })
             .await??;
             *num_bytes_to_send -= u32::expect_from(bytes_written_total);
-            log_offset.0 += u64::from(bytes_written_total);
+            log_offset.0 += bytes_written_total;
         }
         Ok(())
     }

@@ -88,7 +88,7 @@ impl Client {
 
         self.maybe_compact_buf();
 
-        if let None = self.fetch_header().await? {
+        if self.fetch_header().await?.is_none() {
             return Ok(ReadData::None);
         }
 
@@ -256,7 +256,7 @@ impl Client {
                 // self.conn_read.read_u8().await?;
                 Ok(allocation_id)
             },
-            self.conn_write.write_all(&raw_entry)
+            self.conn_write.write_all(raw_entry)
         )?;
 
         let offset = offset_res?;
