@@ -7,68 +7,26 @@
     crane.url = "github:ipetkov/crane";
     crane.inputs.nixpkgs.follows = "nixpkgs";
 
-    flake-compat = {
-      url = "github:edolstra/flake-compat";
-      flake = false;
-    };
-
-    fenix = {
-      url = "github:nix-community/fenix";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-
-    naersk = {
-      url = "github:nix-community/naersk";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
   };
 
-  outputs = { self, naersk, nixpkgs, flake-utils, flake-compat, fenix, crane }:
+  outputs = { self, nixpkgs, flake-utils, crane }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
           inherit system;
         };
-        lib = pkgs.lib;
-        fenix-pkgs = fenix.packages.${system};
-        fenix-channel = fenix-pkgs.complete;
 
-        craneLib = (crane.mkLib pkgs).overrideScope' (final: prev: {
-          cargo = fenix-channel.cargo;
-          rustc = fenix-channel.rustc;
-        });
+        craneLib = (crane.mkLib pkgs);
 
         commonArgs = {
-          src = ./.;
+          src = craneLib.cleanCargoSource (craneLib.path ./.);
           buildInputs = [
           ];
           nativeBuildInputs = [
             pkgs.pkgconfig
-            fenix-channel.rustc
           ];
         };
 
-        # filter source code at path `src` to include only the list of `modules`
-        filterModules = modules: src:
-          let
-            basePath = toString src + "/";
-          in
-          lib.cleanSourceWith {
-            filter = (path: type:
-              let
-                relPath = lib.removePrefix basePath (toString path);
-                includePath =
-                  (type == "directory" && builtins.match "^[^/]+$" relPath != null) ||
-                  lib.any
-                    (re: builtins.match re relPath != null)
-                    ([ "Cargo.lock" "Cargo.toml" ".*/Cargo.toml" ] ++ builtins.concatLists (map (name: [ name "${name}/.*" ]) modules));
-              in
-              # uncomment to debug:
-                # builtins.trace "${relPath}: ${lib.boolToString includePath}"
-              includePath
-            );
-            inherit src;
-          };
 
         workspaceDeps = craneLib.buildDepsOnly (commonArgs // {
           pname = "loglog-workspace-deps";
@@ -80,12 +38,11 @@
         });
 
         # a function to define both package and container build for a given binary
-        pkg = { name, dir, extraDirs ? [ ] }: rec {
+        pkg = { name }: rec {
           package = craneLib.buildPackage (commonArgs // {
             cargoArtifacts = workspaceDeps;
             pname = name;
 
-            src = filterModules ([ dir ] ++ extraDirs) ./.;
 
             cargoExtraArgs = "--bin ${name}";
             doCheck = false;
@@ -105,7 +62,7 @@
           };
         };
 
-        loglogd = pkg { name = "loglogd"; dir = "server"; extraDirs = [ "api" ]; };
+        loglogd = pkg { name = "loglogd"; };
 
       in
       {
@@ -124,13 +81,11 @@
               nativeBuildInputs = workspaceDeps.nativeBuildInputs ++ [
 
                 # extra binaries here
-                fenix-pkgs.rust-analyzer
-                fenix-channel.rustc
-                fenix-channel.cargo
+                pkgs.rust-analyzer
+                pkgs.rustc
+                pkgs.cargo
 
                 # Lints
-                # Note: we're using nixpkgs's `rustfmt` to avoid pulling in whole
-                # `fenix-channel` into CI
                 pkgs.rustfmt
                 pkgs.rnix-lsp
                 pkgs.nodePackages.bash-language-server
@@ -145,9 +100,11 @@
                 pkgs.cargo-udeps
               ];
 
-              RUST_SRC_PATH = "${fenix-channel.rust-src}/lib/rustlib/src/rust/library";
               shellHook = ''
-                for hook in misc/git-hooks/* ; do ln -sf "../../$hook" "./.git/hooks/" ; done
+                # auto-install git hooks
+                dot_git="$(git rev-parse --git-common-dir)"
+                if [[ ! -d "$dot_git/hooks" ]]; then mkdir "$dot_git/hooks"; fi
+                for hook in misc/git-hooks/* ; do ln -sf "$(pwd)/$hook" "$dot_git/hooks/" ; done
                 ${pkgs.git}/bin/git config commit.template misc/git-hooks/commit-template.txt
               '';
             };

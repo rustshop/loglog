@@ -1,4 +1,3 @@
-#![feature(map_first_last)]
 #![deny(clippy::as_conversions)]
 use node::Parameters;
 use opts::Opts;
