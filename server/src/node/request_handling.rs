@@ -332,7 +332,6 @@ impl RequestHandler {
                 // Break into the open segment loop search.
                 break;
             }
-            // TODO(perf): allocates
             let path = segment.file_meta.path();
             drop(read_sealed_segments);
 
@@ -402,17 +401,14 @@ impl RequestHandler {
             // is only how much of it can we serve, before switching
             // to next segment.
 
-            let segment_end_log_offset = if let Some(segment) = read_open_segments
-                .inner
-                .range((*log_offset + LogOffset(1))..)
-                .next()
-            {
-                *segment.0
-            } else {
-                // No open segments after current one (at least yet).
-                // Just use request data as the end pointer
-                LogOffset(log_offset.0 + u64::from(*num_bytes_to_send))
-            };
+            let segment_end_log_offset =
+                if let Some(segment) = read_open_segments.inner.range((*log_offset + 1)..).next() {
+                    *segment.0
+                } else {
+                    // No open segments after current one (at least yet).
+                    // Just use request data as the end pointer
+                    LogOffset(log_offset.0 + u64::from(*num_bytes_to_send))
+                };
 
             drop(read_open_segments);
 

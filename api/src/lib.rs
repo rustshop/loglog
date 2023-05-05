@@ -1,7 +1,8 @@
 use binrw::{BinRead, BinWrite, ReadOptions, WriteOptions};
-use derive_more::{Add, Display, Sub};
+use derive_more::Display;
 use std::io::Read;
 use std::io::Seek;
+use std::ops;
 
 mod net;
 pub use self::net::*;
@@ -15,12 +16,26 @@ pub use self::log::*;
 ///
 /// Notably LogLog for performance reasons includes each entry's
 /// header and trailer the log, but segment file header is not included.
-#[derive(
-    Copy, Clone, Debug, BinRead, BinWrite, PartialEq, Eq, PartialOrd, Ord, Sub, Add, Display,
-)]
+#[derive(Copy, Clone, Debug, BinRead, BinWrite, PartialEq, Eq, PartialOrd, Ord, Display)]
 #[br(big)]
 #[bw(big)]
 pub struct LogOffset(pub u64);
+
+impl ops::Add<u64> for LogOffset {
+    type Output = Self;
+
+    fn add(self, rhs: u64) -> Self::Output {
+        Self(self.0 + rhs)
+    }
+}
+
+impl ops::Sub<Self> for LogOffset {
+    type Output = u64;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        self.0 - rhs.0
+    }
+}
 
 /// External ID of the allocated event buffer
 ///
