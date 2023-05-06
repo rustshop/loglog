@@ -8,6 +8,7 @@ use loglogd_api::{AllocationId, EntryHeader, EntrySize, EntryTrailer, LogOffset,
 use request_handling::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -88,11 +89,22 @@ pub struct NodeShared {
     last_fsynced_log_offset_tx: watch::Sender<LogOffset>,
 }
 
+impl NodeShared {
+    pub fn fsynced_log_offset(&self) -> LogOffset {
+        LogOffset(self.fsynced_log_offset.load(Ordering::Relaxed))
+    }
+}
+
 pub struct NodeCtrl {
     is_node_shutting_down: Arc<AtomicBool>,
+    local_addr: SocketAddr,
 }
 
 impl NodeCtrl {
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
     pub fn stop(&self) {
         self.is_node_shutting_down.store(true, Ordering::SeqCst);
     }
@@ -100,6 +112,7 @@ impl NodeCtrl {
 
 pub struct Node {
     is_node_shutting_down: Arc<AtomicBool>,
+    local_addr: SocketAddr,
     write_loop: tokio::task::JoinHandle<()>,
     segment_preloading_loop: tokio::task::JoinHandle<()>,
     fsync_loop: tokio::task::JoinHandle<()>,
@@ -108,6 +121,9 @@ pub struct Node {
 
 impl Node {
     pub async fn new(listener: TcpListener, params: Parameters) -> NodeResult<Self> {
+        let local_addr = listener
+            .local_addr()
+            .expect("Lister should have been bound to port already");
         let segments = tokio::task::spawn_blocking({
             let data_dir = params.data_dir.clone();
             move || -> NodeResult<Vec<SegmentMeta>> {
@@ -174,6 +190,7 @@ impl Node {
         });
 
         Ok(Node {
+            local_addr,
             write_loop: tokio_uring::spawn(
                 shared
                     .clone()
@@ -207,6 +224,7 @@ impl Node {
     pub fn get_ctrl(&self) -> NodeCtrl {
         NodeCtrl {
             is_node_shutting_down: Arc::clone(&self.is_node_shutting_down),
+            local_addr: self.local_addr,
         }
     }
 

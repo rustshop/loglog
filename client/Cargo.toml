@@ -25,7 +25,7 @@ tokio = { version = "1.19.2", features = ["macros", "rt", "rt-multi-thread", "si
 thiserror = "1.0.31"
 num_enum = "0.5.7"
 nix = "0.24.2"
-binrw = "0.9.2"
+binrw = "0.11.1"
 typed-builder = "0.10.0"
 loglogd-api = { path = "../api/" }
 convi = { version = "0.0.5", features = [ "min_target_pointer_width_32" ] }

@@ -354,7 +354,7 @@ impl OpenSegment {
         };
 
         header
-            .write_to(&mut Cursor::new(&mut buf))
+            .write(&mut Cursor::new(&mut buf))
             .expect("can't fail");
 
         let (res, res_buf) =

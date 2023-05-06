@@ -6,7 +6,7 @@
 //!
 //! This module contains types describing the logical
 //! log (list of entries).
-use binrw::{BinRead, BinWrite};
+use binrw::binrw;
 
 use crate::{EntrySize, TermId};
 
@@ -14,9 +14,9 @@ use crate::{EntrySize, TermId};
 ///
 /// Every log entry is prefixed with a small
 /// header.
-#[derive(BinRead, BinWrite, Debug, Copy, Clone)]
-#[br(big)]
-#[bw(big)]
+#[derive(Debug, Copy, Clone)]
+#[binrw]
+#[brw(big)]
 pub struct EntryHeader {
     /// This is used only for distributed consistency (Raft),
     /// but for performance reasons it's stored in the log
@@ -32,14 +32,14 @@ impl EntryHeader {
     pub const BYTE_SIZE_U64: u64 = 5;
 }
 
-#[derive(BinRead, BinWrite, Debug)]
-#[br(big)]
-#[bw(big)]
 /// Entry suffix.
 ///
 /// Every entry ends with a fixed suffix. This is primarily useful
 /// for detecting if the entry was fully and correctly written to
 /// storage.
+#[derive(Debug)]
+#[binrw]
+#[brw(big)]
 pub struct EntryTrailer {
     // 0xff = valid
     // 0x55 = entry invalid (e.g. client disconnected before fully uploading)

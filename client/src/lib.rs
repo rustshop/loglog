@@ -1,8 +1,8 @@
 use binrw::{BinRead, BinWrite};
 use convi::{CastFrom, ExpectFrom};
 use loglogd_api::{
-    AllocationId, AppendRequestHeader, EntryHeader, EntrySize, EntryTrailer, ReadDataSize,
-    ReadRequestHeader, RequestHeaderCmd, REQUEST_HEADER_SIZE,
+    AllocationId, AppendRequestHeader, ConnectionHello, EntryHeader, EntrySize, EntryTrailer,
+    ReadDataSize, ReadRequestHeader, RequestHeaderCmd, LOGLOGD_VERSION_0, REQUEST_HEADER_SIZE,
 };
 use std::io::Cursor;
 use std::mem;
@@ -23,6 +23,8 @@ pub enum Error {
     Io(#[from] io::Error),
     #[error("data decoding error: {0}")]
     Decoding(#[from] binrw::Error),
+    #[error("invalid protocol version: {0}")]
+    ProtocolVersion(u8),
     #[error("data corrupted")]
     Corrupted,
 }
@@ -49,7 +51,15 @@ impl Client {
         let stream = tokio::net::TcpStream::connect(server_addr).await?;
         trace!(?server_addr, "Connected");
 
-        let (conn_read, conn_write) = tokio::io::split(stream);
+        let (mut conn_read, conn_write) = tokio::io::split(stream);
+
+        let mut buf = [0u8; ConnectionHello::BYTE_SIZE];
+        conn_read.read_exact(&mut buf).await?;
+        let hello = ConnectionHello::read(&mut Cursor::new(&mut buf))?;
+
+        if hello.version != LOGLOGD_VERSION_0 {
+            Err(Error::ProtocolVersion(hello.version))?;
+        }
 
         let log_offset = if let Some(off) = log_offset {
             off
@@ -151,7 +161,7 @@ impl Client {
             limit: ReadDataSize(limit),
         };
 
-        args.write_to(&mut cursor).expect("can't fail");
+        args.write(&mut cursor).expect("can't fail");
         write.write_all(&cmd_buf).await?;
 
         let mut data_size_buf = [0u8; ReadDataSize::BYTE_SIZE];
@@ -239,7 +249,7 @@ impl Client {
             size: EntrySize(u32::expect_from(raw_entry.len())),
         };
 
-        args.write_to(&mut cursor).expect("can't fail");
+        args.write(&mut cursor).expect("can't fail");
         self.conn_write.write_all(&cmd_buf).await?;
 
         let mut entry_log_offset_buf = [0u8; AllocationId::BYTE_SIZE];

@@ -1,4 +1,5 @@
-use binrw::{BinRead, BinWrite, ReadOptions, WriteOptions};
+use binrw::{binrw, Endian};
+use binrw::{BinRead, BinWrite};
 use derive_more::Display;
 use std::io::Read;
 use std::io::Seek;
@@ -42,7 +43,9 @@ impl ops::Sub<Self> for LogOffset {
 /// It coins `TermId`, so that clients "Filling"
 /// data at offsets in non-leader node can be rejected
 /// if the current leader of the node doesn't match.
-#[derive(Copy, Clone, BinRead, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[binrw]
+#[brw(big)]
 pub struct AllocationId {
     pub term: TermId,
     pub offset: LogOffset,
@@ -92,7 +95,9 @@ pub struct TermId(pub u16);
 /// Even though the type here is `u32`, we store (read&write)
 /// only 3Bs - it's just there's no better type to put it in
 /// (like `u24`).
-#[derive(BinRead, BinWrite, Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
+#[binrw]
+#[brw(big)]
 pub struct EntrySize(
     #[br(big, parse_with(EntrySize::parse))]
     #[bw(big, write_with(EntrySize::write))]
@@ -100,7 +105,7 @@ pub struct EntrySize(
 );
 
 impl EntrySize {
-    fn parse<R: Read + Seek>(reader: &mut R, _ro: &ReadOptions, _: ()) -> binrw::BinResult<u32> {
+    fn parse<R: Read + Seek>(reader: &mut R, _endian: Endian, _: ()) -> binrw::BinResult<u32> {
         let mut bytes = [0u8; 3];
         reader.read_exact(&mut bytes)?;
         Ok(u32::from(bytes[0]) << 16 | u32::from(bytes[1]) << 8 | u32::from(bytes[2]))
@@ -109,7 +114,7 @@ impl EntrySize {
     fn write<W: binrw::io::Write + binrw::io::Seek>(
         &amount: &u32,
         writer: &mut W,
-        _opts: &WriteOptions,
+        _endian: Endian,
         _: (),
     ) -> binrw::BinResult<()> {
         let bytes = amount.to_be_bytes();

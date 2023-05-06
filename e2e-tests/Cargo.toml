@@ -39,3 +39,8 @@ loglog-client = { path = "../client/" }
 convi = { version = "0.0.5", features = [ "min_target_pointer_width_32" ] }
 derive_more = "*"
 rand = "*"
+
+[dev-dependencies]
+loglogd = { path = "../server" }
+tempfile = "3.4.0"
+anyhow = "*"

@@ -7,8 +7,9 @@ use crate::{
 use binrw::{BinRead, BinWrite};
 use convi::ExpectFrom;
 use loglogd_api::{
-    AllocationId, AppendRequestHeader, EntryHeader, EntrySize, EntryTrailer, FillRequestHeader,
-    LogOffset, ReadDataSize, ReadRequestHeader, RequestHeaderCmd,
+    AllocationId, AppendRequestHeader, ConnectionHello, EntryHeader, EntrySize, EntryTrailer,
+    FillRequestHeader, GetEndResponse, LogOffset, ReadDataSize, ReadRequestHeader,
+    RequestHeaderCmd, LOGLOGD_VERSION_0,
 };
 use std::{
     cmp,
@@ -81,8 +82,32 @@ impl RequestHandler {
         listener
     }
 
-    /// Handle connection
     pub async fn handle_connection(
+        &self,
+        stream: &mut TcpStream,
+        entry_writer_tx: &mpsc::Sender<EntryWrite>,
+    ) -> ConnectionResult<()> {
+        self.handle_connection_init(stream).await?;
+        self.handle_connection_loop(stream, entry_writer_tx).await?;
+        Ok(())
+    }
+
+    /// Handle connection
+    pub async fn handle_connection_init(&self, stream: &mut TcpStream) -> ConnectionResult<()> {
+        let hello = ConnectionHello {
+            version: LOGLOGD_VERSION_0,
+            // current: self.shared.fsynced_log_offset(),
+        };
+
+        let mut buf = self.shared.pop_entry_buffer().await;
+        hello.write(&mut binrw::io::NoSeek::new(&mut buf))?;
+        let (res, res_buf) = tcpstream_write_all(stream, buf.slice(..)).await;
+        self.shared.put_entry_buffer(res_buf).await;
+        res
+    }
+
+    /// Handle connection
+    pub async fn handle_connection_loop(
         &self,
         stream: &mut TcpStream,
         entry_writer_tx: &mpsc::Sender<EntryWrite>,
@@ -175,6 +200,11 @@ impl RequestHandler {
                     self.handle_read_request(stream, args.offset, args.limit)
                         .await?;
                 }
+                RequestHeaderCmd::GetEnd => {
+                    debug!(cmd = ?cmd);
+
+                    self.handle_get_end_request(stream).await?;
+                }
                 RequestHeaderCmd::Other => Err(ConnectionError::Invalid)?,
             }
         }
@@ -256,7 +286,7 @@ impl RequestHandler {
         vec_extend_to_at_least(&mut buf, total_entry_size);
 
         header
-            .write_to(&mut Cursor::new(&mut buf[0..entry_header_size]))
+            .write(&mut Cursor::new(&mut buf[0..entry_header_size]))
             .expect("Can't fail");
 
         let (read_res, res_buf) = read_payload(stream, buf, payload_size).await;
@@ -271,7 +301,7 @@ impl RequestHandler {
         };
 
         trailer
-            .write_to(&mut Cursor::new(
+            .write(&mut Cursor::new(
                 &mut buf[total_entry_size - entry_trailer_size..total_entry_size],
             ))
             .expect("Can't fail");
@@ -524,5 +554,17 @@ impl RequestHandler {
         }
 
         Ok(())
+    }
+
+    async fn handle_get_end_request(&self, stream: &mut TcpStream) -> ConnectionResult<()> {
+        let resp = GetEndResponse {
+            offset: self.shared.fsynced_log_offset(),
+        };
+
+        let mut buf = self.shared.pop_entry_buffer().await;
+        resp.write(&mut binrw::io::NoSeek::new(&mut buf))?;
+        let (res, res_buf) = tcpstream_write_all(stream, buf.slice(0..4)).await;
+        self.shared.put_entry_buffer(res_buf).await;
+        res
     }
 }

@@ -38,22 +38,26 @@
         });
 
         # a function to define both package and container build for a given binary
-        pkg = { name }: rec {
-          package = craneLib.buildPackage (commonArgs // {
-            cargoArtifacts = workspaceDeps;
-            pname = name;
+        pkg = { bin, cargoToml }: rec {
+          package =
+            let
+              meta = craneLib.crateNameFromCargoToml { inherit cargoToml; };
+            in
+            craneLib.buildPackage (commonArgs // {
+              pname = builtins.trace meta.pname meta.pname;
+              version = meta.version;
 
 
-            cargoExtraArgs = "--bin ${name}";
-            doCheck = false;
-          });
+              cargoExtraArgs = "--bin ${bin}";
+              doCheck = false;
+            });
 
           container = pkgs.dockerTools.buildLayeredImage {
-            name = name;
+            name = bin;
             contents = [ package ];
             config = {
               Cmd = [
-                "${package}/bin/${name}"
+                "${package}/bin/${bin}"
               ];
               ExposedPorts = {
                 "8000/tcp" = { };
@@ -62,7 +66,7 @@
           };
         };
 
-        loglogd = pkg { name = "loglogd"; };
+        loglogd = pkg { bin = "loglogd"; cargoToml = ./server/Cargo.toml; };
 
       in
       {

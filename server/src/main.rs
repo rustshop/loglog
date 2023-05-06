@@ -1,36 +1,14 @@
 #![deny(clippy::as_conversions)]
-use node::Parameters;
 use opts::Opts;
 use std::error::Error;
 use std::io;
-use thiserror::Error;
 use tokio::signal;
-use tokio_uring::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::node::Node;
-
-mod ioutil;
-mod node;
 mod opts;
-mod segment;
 
-/// A `?`-like macro to call functions that return values in `(res, buf)` uring-convention
-#[macro_export]
-macro_rules! uring_try_rec {
-    ($buf:ident, $e:expr) => {{
-        let (res, res_buf) = $e;
-        $buf = res_buf;
-
-        match res {
-            Err(e) => {
-                return (Err(e.into()), $buf);
-            }
-            Ok(o) => o,
-        }
-    }};
-}
+use loglogd::node::Parameters;
 
 fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::registry()
@@ -54,21 +32,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         params.base_segment_file_size(Parameters::DEFAULT_BASE_SEGMENT_SIZE)
     };
 
-    let params = params.build();
-    let listen = opts.listen;
-
     tokio_uring::start(async {
-        info!(
-            listen = %listen,
-            "data-dir" = %params.data_dir.display(),
-            "Starting loglogd"
-        );
-        info!("Listening on: {:?}", listen);
-        let listener = TcpListener::bind(listen)?;
+        let node = loglogd::start_in_tokio_uring(params.build(), opts.listen).await?;
 
-        let node = Node::new(listener, params.clone()).await?;
         let node_ctrl = node.get_ctrl();
-
         tokio_uring::spawn(async move {
             wait_for_shutdown_signal().await;
             info!("signal received, starting graceful shutdown");
@@ -108,21 +75,3 @@ async fn wait_for_shutdown_signal() {
         _ = terminate => {},
     }
 }
-
-#[derive(Error, Debug)]
-pub enum ConnectionError {
-    #[error("disconnected")]
-    Disconected,
-    #[error("invalid data")]
-    Invalid,
-    #[error("invalid data: {0}")]
-    ParseError(#[from] binrw::Error),
-    #[error("io: {0}")]
-    IO(#[from] io::Error),
-    #[error("join: {0}")]
-    JoinError(#[from] tokio::task::JoinError),
-}
-
-pub type RingConnectionResult<T> = (ConnectionResult<T>, Vec<u8>);
-
-pub type ConnectionResult<T> = std::result::Result<T, ConnectionError>;
