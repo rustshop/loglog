@@ -74,6 +74,30 @@ async fn basic_sanity() -> anyhow::Result<()> {
 }
 
 #[test]
+async fn basic_serial() -> anyhow::Result<()> {
+    // init_logging();
+
+    let server = TestLoglogd::new()?;
+
+    let mut writer_client = server.new_client().await?;
+    let mut reader_client = server.new_client().await?;
+
+    for b in 0u8..100 {
+        let msg: Vec<u8> = std::iter::repeat(b).take(b as usize).collect();
+
+        writer_client.append(&msg).await.unwrap();
+    }
+
+    for b in 0u8..100 {
+        let msg: Vec<u8> = std::iter::repeat(b).take(b as usize).collect();
+
+        assert_eq!(reader_client.next_raw().await.unwrap(), &msg);
+    }
+
+    Ok(())
+}
+
+#[test]
 async fn basic_concurrent() -> anyhow::Result<()> {
     // init_logging();
 
