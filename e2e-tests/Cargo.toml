@@ -25,6 +25,7 @@ name = "writer"
 path = "src/bin/writer.rs"
 
 [dependencies]
+atty = "*"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing = "0.1.35"
 clap = { version = "3.1.6", features = [ "derive", "env" ] }

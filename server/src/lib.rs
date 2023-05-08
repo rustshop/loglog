@@ -27,7 +27,7 @@ pub async fn start_in_tokio_uring(
     Ok(Node::new(listener, params.clone()).await?)
 }
 
-async fn start_in_tokio_uring_and_send(
+async fn start_in_tokio_uring_and_send_ctrl_handle(
     params: Parameters,
     listen: SocketAddr,
     tx: std::sync::mpsc::Sender<NodeCtrl>,
@@ -39,6 +39,7 @@ async fn start_in_tokio_uring_and_send(
     let _ = tx.send(node_ctrl);
 
     let _listener = node.wait().await?;
+    info!("loglogd finished");
 
     // Workaround: for some reason finishing this `tokio-uring` scope
     // hangs, most probably on the outstanding `accept` request on
@@ -55,7 +56,7 @@ pub fn start(
 
     thread::spawn(move || {
         tokio_uring::start(async move {
-            let _ = start_in_tokio_uring_and_send(params, listen, tx).await;
+            let _ = start_in_tokio_uring_and_send_ctrl_handle(params, listen, tx).await;
         })
     });
 
