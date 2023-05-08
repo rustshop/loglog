@@ -1,12 +1,9 @@
 use anyhow::anyhow;
 use anyhow::Result;
-use loglog::LogOffset;
 use loglogd::node::Parameters;
-use std::io;
 use std::path::Path;
 use std::{net::SocketAddr, str::FromStr};
 use tokio::test;
-use tracing_subscriber::prelude::*;
 
 pub struct TestLoglogd {
     data_dir: tempfile::TempDir,
@@ -34,7 +31,7 @@ impl TestLoglogd {
     }
 
     pub async fn new_client(&self) -> Result<loglog::Client> {
-        Ok(loglog::Client::connect(self.local_addr(), Some(LogOffset(0))).await?)
+        Ok(loglog::Client::connect(self.local_addr(), None).await?)
     }
 }
 
@@ -44,18 +41,20 @@ impl Drop for TestLoglogd {
     }
 }
 
-fn init_logging() {
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
-        ))
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(atty::is(atty::Stream::Stderr))
-                .with_writer(io::stderr),
-        )
-        .init();
-}
+// fn init_logging() {
+// use std::io;
+// use tracing_subscriber::prelude::*;
+//     tracing_subscriber::registry()
+//         .with(tracing_subscriber::EnvFilter::new(
+//             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
+//         ))
+//         .with(
+//             tracing_subscriber::fmt::layer()
+//                 .with_ansi(atty::is(atty::Stream::Stderr))
+//                 .with_writer(io::stderr),
+//         )
+//         .init();
+// }
 
 #[test]
 async fn basic_sanity() -> anyhow::Result<()> {
@@ -67,8 +66,8 @@ async fn basic_sanity() -> anyhow::Result<()> {
 
     client.append(&[1, 2, 3]).await?;
     client.append(&[4, 3, 2]).await?;
-    assert_eq!(client.next_raw().await?, [1, 2, 3]);
-    assert_eq!(client.next_raw().await?, [4, 3, 2]);
+    assert_eq!(client.read().await?, [1, 2, 3]);
+    assert_eq!(client.read().await?, [4, 3, 2]);
 
     Ok(())
 }
@@ -91,7 +90,7 @@ async fn basic_serial() -> anyhow::Result<()> {
     for b in 0u8..100 {
         let msg: Vec<u8> = std::iter::repeat(b).take(b as usize).collect();
 
-        assert_eq!(reader_client.next_raw().await.unwrap(), &msg);
+        assert_eq!(reader_client.read().await.unwrap(), &msg);
     }
 
     Ok(())
@@ -118,12 +117,33 @@ async fn basic_concurrent() -> anyhow::Result<()> {
         for b in 0u8..100 {
             let msg: Vec<u8> = std::iter::repeat(b).take(b as usize).collect();
 
-            assert_eq!(reader_client.next_raw().await.unwrap(), &msg);
+            assert_eq!(reader_client.read().await.unwrap(), &msg);
         }
     });
 
     reader_task.await?;
     writer_task.await?;
+
+    Ok(())
+}
+
+#[test]
+async fn basic_start_none() -> anyhow::Result<()> {
+    // init_logging();
+
+    let server = TestLoglogd::new()?;
+
+    let mut client1 = server.new_client().await?;
+
+    client1.append(&[1, 2, 3]).await?;
+
+    let mut client2 = server.new_client().await?;
+
+    client2.append(&[4, 3, 2]).await?;
+
+    assert_eq!(client1.read().await?, [1, 2, 3]);
+    assert_eq!(client1.read().await?, [4, 3, 2]);
+    assert_eq!(client2.read().await?, [4, 3, 2]);
 
     Ok(())
 }

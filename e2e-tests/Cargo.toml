@@ -15,11 +15,6 @@ readme = "../README.md"
 name = "loglog_e2e"
 path = "src/lib.rs"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-[[bin]]
-name = "sanity"
-path = "src/bin/sanity.rs"
-
 [[bin]]
 name = "writer"
 path = "src/bin/writer.rs"

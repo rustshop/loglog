@@ -2,7 +2,8 @@ use binrw::{BinRead, BinWrite};
 use convi::{CastFrom, ExpectFrom};
 use loglogd_api::{
     AllocationId, AppendRequestHeader, ConnectionHello, EntryHeader, EntrySize, EntryTrailer,
-    ReadDataSize, ReadRequestHeader, RequestHeaderCmd, LOGLOGD_VERSION_0, REQUEST_HEADER_SIZE,
+    GetEndResponse, ReadDataSize, ReadRequestHeader, RequestHeaderCmd, LOGLOGD_VERSION_0,
+    REQUEST_HEADER_SIZE,
 };
 use std::io::Cursor;
 use std::mem;
@@ -31,6 +32,7 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// `loglog` client
 pub struct Client {
     log_offset: LogOffset,
     buf: Vec<u8>,
@@ -51,7 +53,7 @@ impl Client {
         let stream = tokio::net::TcpStream::connect(server_addr).await?;
         trace!(?server_addr, "Connected");
 
-        let (mut conn_read, conn_write) = tokio::io::split(stream);
+        let (mut conn_read, mut conn_write) = tokio::io::split(stream);
 
         let mut buf = [0u8; ConnectionHello::BYTE_SIZE];
         conn_read.read_exact(&mut buf).await?;
@@ -64,7 +66,7 @@ impl Client {
         let log_offset = if let Some(off) = log_offset {
             off
         } else {
-            unimplemented!("send a command a find a first offset");
+            Self::inner_get_end(&mut conn_read, &mut conn_write).await?
         };
 
         Ok(Self {
@@ -76,7 +78,7 @@ impl Client {
         })
     }
 
-    pub async fn next_raw(&mut self) -> Result<&[u8]> {
+    pub async fn read(&mut self) -> Result<&[u8]> {
         loop {
             match self.next_raw_inner().await? {
                 ReadData::None => {
@@ -93,7 +95,7 @@ impl Client {
     }
 
     /// Return next raw entry
-    pub async fn next_raw_inner(&mut self) -> Result<ReadData<&'_ [u8]>> {
+    async fn next_raw_inner(&mut self) -> Result<ReadData<&'_ [u8]>> {
         debug_assert!(self.next_event_i <= self.buf.len());
 
         self.maybe_compact_buf();
@@ -129,6 +131,96 @@ impl Client {
         Ok(ReadData::Some(&self.buf[payload_start_i..payload_end_i]))
     }
 
+    /// The [`LogOffset`] of end of the stream (right after last commited entry)
+    pub async fn end_offset(&mut self) -> Result<LogOffset> {
+        Self::inner_get_end(&mut self.conn_read, &mut self.conn_write).await
+    }
+
+    /// Append an entry, without waiting for it to get commited in the log
+    pub async fn append_nocommit(&mut self, raw_entry: &[u8]) -> Result<LogOffset> {
+        debug!(size = raw_entry.len(), "Appending new entry");
+        let mut cmd_buf = [0u8; REQUEST_HEADER_SIZE];
+
+        let mut cursor = Cursor::new(&mut cmd_buf[0..]);
+
+        std::io::Write::write_all(&mut cursor, &[RequestHeaderCmd::Append.into()])
+            .expect("can't fail");
+
+        let args = AppendRequestHeader {
+            size: EntrySize(u32::expect_from(raw_entry.len())),
+        };
+
+        args.write(&mut cursor).expect("can't fail");
+        self.conn_write.write_all(&cmd_buf).await?;
+
+        let mut entry_log_offset_buf = [0u8; AllocationId::BYTE_SIZE];
+
+        let (offset_res, _sent) = try_join!(
+            async {
+                self.conn_read.read_exact(&mut entry_log_offset_buf).await?;
+
+                let allocation_id = AllocationId::read(&mut Cursor::new(&entry_log_offset_buf));
+                // TODO: in the future here we will start sending the `raw_entry` to other peers
+                // right away using `Fill` call
+
+                // TODO: should we have any sort of "we're done here"?
+                // self.conn_read.read_u8().await?;
+                Ok(allocation_id)
+            },
+            self.conn_write.write_all(raw_entry)
+        )?;
+
+        let offset = offset_res?;
+
+        debug!(offset = %offset.offset, "New entry offset");
+        Ok(offset.offset)
+    }
+
+    /// Append an entry and waiti for it to get commited in the log
+    pub async fn append(&mut self, raw_entry: &[u8]) -> Result<LogOffset> {
+        let offset = self.append_nocommit(raw_entry).await?;
+        loop {
+            let read_start = Instant::now();
+            match self.append_read_commit(offset).await? {
+                ReadData::None => {
+                    let read_duration = read_start.elapsed();
+                    let min_read_duration = Duration::from_secs(1);
+                    if read_duration < min_read_duration {
+                        sleep(min_read_duration - read_duration).await;
+                    }
+                    continue;
+                }
+                ReadData::Invalid => {
+                    // we are actually not reading the whole entry, so we
+                    // are not checking if the written entry is valid. It
+                    // should be - if we returned any IO errors, we wouldn't be
+                    // here.
+                    unreachable!();
+                }
+                // 🤷 https://github.com/rust-lang/rust/issues/68117#issuecomment-573309675
+                ReadData::Some(offset) => return Ok(offset),
+            };
+        }
+    }
+
+    /// Wait for the server to commit to the written entry
+    ///
+    /// We use the offset returned for the allocated entry and
+    /// just need to
+    async fn append_read_commit(&mut self, offset: LogOffset) -> Result<ReadData<LogOffset>> {
+        let data_size =
+            Self::inner_read(&mut self.conn_read, &mut self.conn_write, offset, 1).await?;
+
+        if data_size == 0 {
+            return Ok(ReadData::None);
+        }
+        debug_assert_eq!(data_size, 1);
+        // read that one byte out
+        self.conn_read.read_u8().await?;
+
+        Ok(ReadData::Some(offset))
+    }
+
     async fn fetch_header(&mut self) -> Result<Option<()>> {
         while !self.has_header() {
             match self.fetch_more_data().await? {
@@ -139,11 +231,33 @@ impl Client {
         Ok(Some(()))
     }
 
+    async fn inner_get_end(
+        mut read: impl AsyncReadExt + Unpin,
+        mut write: impl AsyncWriteExt + Unpin,
+    ) -> Result<LogOffset> {
+        let mut cmd_buf = [0u8; REQUEST_HEADER_SIZE];
+
+        let mut cursor = Cursor::new(&mut cmd_buf[0..]);
+
+        std::io::Write::write_all(&mut cursor, &[RequestHeaderCmd::GetEnd.into()])
+            .expect("can't fail");
+
+        write.write_all(&cmd_buf).await?;
+
+        let mut data_size_buf = [0u8; GetEndResponse::BYTE_SIZE];
+
+        read.read_exact(&mut data_size_buf).await?;
+
+        let response = GetEndResponse::read(&mut Cursor::new(data_size_buf.as_slice()))?;
+
+        Ok(response.offset)
+    }
+
     /// Send a read command to the server, read back the response size
     ///
     /// Returns number of bytes the server is going to send
     /// over through the `read`
-    async fn send_read_cmd(
+    async fn inner_read(
         mut read: impl AsyncReadExt + Unpin,
         mut write: impl AsyncWriteExt + Unpin,
         log_offset: LogOffset,
@@ -179,7 +293,7 @@ impl Client {
     /// Ok(None) - no more data available
     /// OK(Some(size)) - new data loaded
     async fn fetch_more_data(&mut self) -> Result<Option<usize>> {
-        let data_size = Self::send_read_cmd(
+        let data_size = Self::inner_read(
             &mut self.conn_read,
             &mut self.conn_write,
             self.log_offset,
@@ -234,88 +348,5 @@ impl Client {
 
     fn bytes_available(&mut self) -> usize {
         self.buf.len() - self.next_event_i
-    }
-
-    pub async fn append_nocommit(&mut self, raw_entry: &[u8]) -> Result<LogOffset> {
-        debug!(size = raw_entry.len(), "Appending new entry");
-        let mut cmd_buf = [0u8; REQUEST_HEADER_SIZE];
-
-        let mut cursor = Cursor::new(&mut cmd_buf[0..]);
-
-        std::io::Write::write_all(&mut cursor, &[RequestHeaderCmd::Append.into()])
-            .expect("can't fail");
-
-        let args = AppendRequestHeader {
-            size: EntrySize(u32::expect_from(raw_entry.len())),
-        };
-
-        args.write(&mut cursor).expect("can't fail");
-        self.conn_write.write_all(&cmd_buf).await?;
-
-        let mut entry_log_offset_buf = [0u8; AllocationId::BYTE_SIZE];
-
-        let (offset_res, _sent) = try_join!(
-            async {
-                self.conn_read.read_exact(&mut entry_log_offset_buf).await?;
-
-                let allocation_id = AllocationId::read(&mut Cursor::new(&entry_log_offset_buf));
-                // TODO: in the future here we will start sending the `raw_entry` to other peers
-                // right away using `Fill` call
-
-                // TODO: should we have any sort of "we're done here"?
-                // self.conn_read.read_u8().await?;
-                Ok(allocation_id)
-            },
-            self.conn_write.write_all(raw_entry)
-        )?;
-
-        let offset = offset_res?;
-
-        debug!(offset = %offset.offset, "New entry offset");
-        Ok(offset.offset)
-    }
-
-    pub async fn append(&mut self, raw_entry: &[u8]) -> Result<LogOffset> {
-        let offset = self.append_nocommit(raw_entry).await?;
-        loop {
-            let read_start = Instant::now();
-            match self.append_read_commit(offset).await? {
-                ReadData::None => {
-                    let read_duration = read_start.elapsed();
-                    let min_read_duration = Duration::from_secs(1);
-                    if read_duration < min_read_duration {
-                        sleep(min_read_duration - read_duration).await;
-                    }
-                    continue;
-                }
-                ReadData::Invalid => {
-                    // we are actually not reading the whole entry, so we
-                    // are not checking if the written entry is valid. It
-                    // should be - if we returned any IO errors, we wouldn't be
-                    // here.
-                    unreachable!();
-                }
-                // 🤷 https://github.com/rust-lang/rust/issues/68117#issuecomment-573309675
-                ReadData::Some(offset) => return Ok(offset),
-            };
-        }
-    }
-
-    /// Wait for the server to commit to the written entry
-    ///
-    /// We use the offset returned for the allocated entry and
-    /// just need to
-    pub async fn append_read_commit(&mut self, offset: LogOffset) -> Result<ReadData<LogOffset>> {
-        let data_size =
-            Self::send_read_cmd(&mut self.conn_read, &mut self.conn_write, offset, 1).await?;
-
-        if data_size == 0 {
-            return Ok(ReadData::None);
-        }
-        debug_assert_eq!(data_size, 1);
-        // read that one byte out
-        self.conn_read.read_u8().await?;
-
-        Ok(ReadData::Some(offset))
     }
 }

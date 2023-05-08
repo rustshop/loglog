@@ -82,3 +82,7 @@ impl ReadDataSize {
 pub struct GetEndResponse {
     pub offset: LogOffset,
 }
+
+impl GetEndResponse {
+    pub const BYTE_SIZE: usize = 8;
+}

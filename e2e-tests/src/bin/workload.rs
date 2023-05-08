@@ -36,7 +36,7 @@ async fn main() -> AppResult<()> {
     //     .change_context(AppError)?;
 
     loop {
-        let entry = client.next_raw().await.report().change_context(AppError)?;
+        let entry = client.read().await.report().change_context(AppError)?;
         println!("{:?}", entry);
     }
 }

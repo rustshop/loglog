@@ -563,7 +563,8 @@ impl RequestHandler {
 
         let mut buf = self.shared.pop_entry_buffer().await;
         resp.write(&mut binrw::io::NoSeek::new(&mut buf))?;
-        let (res, res_buf) = tcpstream_write_all(stream, buf.slice(0..4)).await;
+
+        let (res, res_buf) = tcpstream_write_all(stream, buf.slice(..)).await;
         self.shared.put_entry_buffer(res_buf).await;
         res
     }
