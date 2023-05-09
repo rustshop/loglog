@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use binrw::{BinRead, BinWrite};
 use convi::{CastFrom, ExpectFrom};
 use loglogd_api::{
@@ -32,8 +33,20 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[async_trait]
+pub trait Client {
+    type InEntry<'a>;
+    type OutEntry<'a>
+    where
+        Self: 'a;
+    async fn read(&mut self) -> Result<Self::OutEntry<'_>>;
+    async fn end_offset(&mut self) -> Result<LogOffset>;
+    async fn append_nocommit(&mut self, raw_entry: Self::InEntry<'_>) -> Result<LogOffset>;
+    async fn append(&mut self, raw_entry: Self::InEntry<'_>) -> Result<LogOffset>;
+}
+
 /// `loglog` client
-pub struct Client {
+pub struct RawClient {
     log_offset: LogOffset,
     buf: Vec<u8>,
     next_event_i: usize,
@@ -47,38 +60,12 @@ pub enum ReadData<T> {
     Some(T),
 }
 
-impl Client {
-    pub async fn connect(server_addr: SocketAddr, log_offset: Option<LogOffset>) -> Result<Self> {
-        debug!(?server_addr, "Connecting to loglogd");
-        let stream = tokio::net::TcpStream::connect(server_addr).await?;
-        trace!(?server_addr, "Connected");
+#[async_trait]
+impl Client for RawClient {
+    type InEntry<'a> = &'a [u8];
+    type OutEntry<'a> = &'a [u8];
 
-        let (mut conn_read, mut conn_write) = tokio::io::split(stream);
-
-        let mut buf = [0u8; ConnectionHello::BYTE_SIZE];
-        conn_read.read_exact(&mut buf).await?;
-        let hello = ConnectionHello::read(&mut Cursor::new(&mut buf))?;
-
-        if hello.version != LOGLOGD_VERSION_0 {
-            Err(Error::ProtocolVersion(hello.version))?;
-        }
-
-        let log_offset = if let Some(off) = log_offset {
-            off
-        } else {
-            Self::inner_get_end(&mut conn_read, &mut conn_write).await?
-        };
-
-        Ok(Self {
-            buf: vec![],
-            log_offset,
-            next_event_i: 0,
-            conn_read,
-            conn_write,
-        })
-    }
-
-    pub async fn read(&mut self) -> Result<&[u8]> {
+    async fn read(&mut self) -> Result<&[u8]> {
         loop {
             match self.next_raw_inner().await? {
                 ReadData::None => {
@@ -94,50 +81,13 @@ impl Client {
         }
     }
 
-    /// Return next raw entry
-    async fn next_raw_inner(&mut self) -> Result<ReadData<&'_ [u8]>> {
-        debug_assert!(self.next_event_i <= self.buf.len());
-
-        self.maybe_compact_buf();
-
-        if self.fetch_header().await?.is_none() {
-            return Ok(ReadData::None);
-        }
-
-        let header = EntryHeader::read(&mut Cursor::new(&self.buf[self.next_event_i..]))?;
-
-        let payload_start_i = self.next_event_i + EntryHeader::BYTE_SIZE;
-        let payload_end_i =
-            self.next_event_i + EntryHeader::BYTE_SIZE + usize::cast_from(header.payload_size.0);
-
-        while self.bytes_available()
-            < usize::expect_from(header.payload_size.0)
-                + EntryHeader::BYTE_SIZE
-                + EntryTrailer::BYTE_SIZE
-        {
-            if self.fetch_more_data().await?.is_none() {
-                return Ok(ReadData::None);
-            }
-        }
-
-        let trailer = EntryTrailer::read(&mut Cursor::new(&self.buf[payload_end_i..]))?;
-
-        if !trailer.is_valid().ok_or(Error::Corrupted)? {
-            return Ok(ReadData::Invalid);
-        }
-
-        self.next_event_i = payload_end_i + EntryTrailer::BYTE_SIZE;
-
-        Ok(ReadData::Some(&self.buf[payload_start_i..payload_end_i]))
-    }
-
     /// The [`LogOffset`] of end of the stream (right after last commited entry)
-    pub async fn end_offset(&mut self) -> Result<LogOffset> {
+    async fn end_offset(&mut self) -> Result<LogOffset> {
         Self::inner_get_end(&mut self.conn_read, &mut self.conn_write).await
     }
 
     /// Append an entry, without waiting for it to get commited in the log
-    pub async fn append_nocommit(&mut self, raw_entry: &[u8]) -> Result<LogOffset> {
+    async fn append_nocommit(&mut self, raw_entry: &[u8]) -> Result<LogOffset> {
         debug!(size = raw_entry.len(), "Appending new entry");
         let mut cmd_buf = [0u8; REQUEST_HEADER_SIZE];
 
@@ -177,7 +127,7 @@ impl Client {
     }
 
     /// Append an entry and waiti for it to get commited in the log
-    pub async fn append(&mut self, raw_entry: &[u8]) -> Result<LogOffset> {
+    async fn append(&mut self, raw_entry: &[u8]) -> Result<LogOffset> {
         let offset = self.append_nocommit(raw_entry).await?;
         loop {
             let read_start = Instant::now();
@@ -201,6 +151,74 @@ impl Client {
                 ReadData::Some(offset) => return Ok(offset),
             };
         }
+    }
+}
+impl RawClient {
+    pub async fn connect(server_addr: SocketAddr, log_offset: Option<LogOffset>) -> Result<Self> {
+        debug!(?server_addr, "Connecting to loglogd");
+        let stream = tokio::net::TcpStream::connect(server_addr).await?;
+        trace!(?server_addr, "Connected");
+
+        let (mut conn_read, mut conn_write) = tokio::io::split(stream);
+
+        let mut buf = [0u8; ConnectionHello::BYTE_SIZE];
+        conn_read.read_exact(&mut buf).await?;
+        let hello = ConnectionHello::read(&mut Cursor::new(&mut buf))?;
+
+        if hello.version != LOGLOGD_VERSION_0 {
+            Err(Error::ProtocolVersion(hello.version))?;
+        }
+
+        let log_offset = if let Some(off) = log_offset {
+            off
+        } else {
+            Self::inner_get_end(&mut conn_read, &mut conn_write).await?
+        };
+
+        Ok(Self {
+            buf: vec![],
+            log_offset,
+            next_event_i: 0,
+            conn_read,
+            conn_write,
+        })
+    }
+
+    /// Return next raw entry
+    async fn next_raw_inner(&mut self) -> Result<ReadData<&'_ [u8]>> {
+        debug_assert!(self.next_event_i <= self.buf.len());
+
+        self.maybe_compact_buf();
+
+        if self.fetch_header().await?.is_none() {
+            return Ok(ReadData::None);
+        }
+
+        let header = EntryHeader::read(&mut Cursor::new(&self.buf[self.next_event_i..]))?;
+
+        let payload_start_i = self.next_event_i + EntryHeader::BYTE_SIZE;
+        let payload_end_i =
+            self.next_event_i + EntryHeader::BYTE_SIZE + usize::cast_from(header.payload_size.0);
+
+        while self.bytes_available()
+            < usize::expect_from(header.payload_size.0)
+                + EntryHeader::BYTE_SIZE
+                + EntryTrailer::BYTE_SIZE
+        {
+            if self.fetch_more_data().await?.is_none() {
+                return Ok(ReadData::None);
+            }
+        }
+
+        let trailer = EntryTrailer::read(&mut Cursor::new(&self.buf[payload_end_i..]))?;
+
+        if !trailer.is_valid().ok_or(Error::Corrupted)? {
+            return Ok(ReadData::Invalid);
+        }
+
+        self.next_event_i = payload_end_i + EntryTrailer::BYTE_SIZE;
+
+        Ok(ReadData::Some(&self.buf[payload_start_i..payload_end_i]))
     }
 
     /// Wait for the server to commit to the written entry

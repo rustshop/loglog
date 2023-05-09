@@ -1,5 +1,6 @@
 use anyhow::anyhow;
 use anyhow::Result;
+use loglog::Client;
 use loglogd::node::Parameters;
 use std::path::Path;
 use std::{net::SocketAddr, str::FromStr};
@@ -30,8 +31,8 @@ impl TestLoglogd {
         self.data_dir.path()
     }
 
-    pub async fn new_client(&self) -> Result<loglog::Client> {
-        Ok(loglog::Client::connect(self.local_addr(), None).await?)
+    pub async fn new_client(&self) -> Result<loglog::RawClient> {
+        Ok(loglog::RawClient::connect(self.local_addr(), None).await?)
     }
 }
 

@@ -2,7 +2,7 @@ use std::io;
 
 use derive_more::Display;
 use error_stack::{Context, IntoReport, ResultExt};
-use loglog::{Client, LogOffset};
+use loglog::{Client, LogOffset, RawClient};
 use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, Display)]
@@ -24,16 +24,10 @@ async fn main() -> AppResult<()> {
 
     let opts = loglog_e2e::Opts::from_args();
 
-    let mut client = Client::connect(opts.server_addr, Some(LogOffset(0)))
+    let mut client = RawClient::connect(opts.server_addr, Some(LogOffset(0)))
         .await
         .report()
         .change_context(AppError)?;
-
-    // client
-    //     .append_nocommit(&[1, 2, 3])
-    //     .await
-    //     .report()
-    //     .change_context(AppError)?;
 
     loop {
         let entry = client.read().await.report().change_context(AppError)?;

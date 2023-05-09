@@ -1,7 +1,7 @@
 use clap::Parser;
 use derive_more::Display;
 use error_stack::{Context, IntoReport, Report, ResultExt};
-use loglog::{Client, LogOffset};
+use loglog::{Client, LogOffset, RawClient};
 use rand::{prelude::StdRng, Rng, SeedableRng};
 use std::{
     io,
@@ -76,7 +76,7 @@ async fn main() -> AppResult<()> {
                 .take(opts.entry_size)
                 .collect::<Vec<u8>>();
 
-            let mut client = Client::connect(opts.common.server_addr, Some(LogOffset(0)))
+            let mut client = RawClient::connect(opts.common.server_addr, Some(LogOffset(0)))
                 .await
                 .report()
                 .change_context(AppError)?;
