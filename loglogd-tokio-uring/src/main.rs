@@ -8,7 +8,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod opts;
 
-use loglogd::node::Parameters;
+use loglogd_tokio_uring::node::Parameters;
 
 fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::registry()
@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     tokio_uring::start(async {
-        let node = loglogd::start_in_tokio_uring(params.build(), opts.listen).await?;
+        let node = loglogd_tokio_uring::start_in_tokio_uring(params.build(), opts.listen).await?;
 
         let node_ctrl = node.get_ctrl();
         tokio_uring::spawn(async move {
@@ -67,6 +67,7 @@ async fn wait_for_shutdown_signal() {
             .await;
     };
 
+    #[allow(inactive-code)]
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 

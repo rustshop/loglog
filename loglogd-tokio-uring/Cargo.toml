@@ -1,5 +1,5 @@
 [package]
-name = "loglogd"
+name = "loglogd-tokio-uring"
 version = "0.1.0"
 edition = "2021"
 authors = ["Dawid Ciężarkiewicz <dpc@dpc.pw>"]
@@ -13,7 +13,7 @@ readme = "../README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [[bin]]
-name = "loglogd"
+name = "loglogd-tokio-uring"
 path = "src/main.rs"
 
 [dependencies]

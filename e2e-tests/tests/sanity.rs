@@ -1,21 +1,21 @@
 use anyhow::anyhow;
 use anyhow::Result;
-use loglog::Client;
-use loglogd::node::Parameters;
+use loglog_tokio::Client;
+use loglogd_tokio_uring::node::Parameters;
 use std::path::Path;
 use std::{net::SocketAddr, str::FromStr};
 use tokio::test;
 
 pub struct TestLoglogd {
     data_dir: tempfile::TempDir,
-    node_ctrl: loglogd::node::NodeCtrl,
+    node_ctrl: loglogd_tokio_uring::node::NodeCtrl,
 }
 
 impl TestLoglogd {
     pub fn new() -> anyhow::Result<Self> {
         let dir = tempfile::tempdir()?;
         let params = Parameters::builder().data_dir(dir.path().to_owned());
-        let node_ctrl = loglogd::start(params.build(), SocketAddr::from_str("[::]:0")?)
+        let node_ctrl = loglogd_tokio_uring::start(params.build(), SocketAddr::from_str("[::]:0")?)
             .map_err(|e| anyhow!(e))?;
         Ok(Self {
             data_dir: dir,
@@ -31,8 +31,8 @@ impl TestLoglogd {
         self.data_dir.path()
     }
 
-    pub async fn new_client(&self) -> Result<loglog::RawClient> {
-        Ok(loglog::RawClient::connect(self.local_addr(), None).await?)
+    pub async fn new_client(&self) -> Result<loglog_tokio::RawClient> {
+        Ok(loglog_tokio::RawClient::connect(self.local_addr(), None).await?)
     }
 }
 

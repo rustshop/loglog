@@ -1,7 +1,7 @@
 use clap::Parser;
 use derive_more::Display;
 use error_stack::{Context, IntoReport, Report, ResultExt};
-use loglog::{Client, LogOffset, RawClient};
+use loglog_tokio::{Client, LogOffset, RawClient};
 use rand::{prelude::StdRng, Rng, SeedableRng};
 use std::{
     io,
