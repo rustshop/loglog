@@ -10,12 +10,12 @@ use crate::node::write_loop::WriteLoop;
 use crate::segment::{OpenSegment, SegmentMeta};
 use loglogd_api::{AllocationId, EntryHeader, EntrySize, EntryTrailer, LogOffset, NodeId, TermId};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, RwLock};
+use std::{io, ops};
 use thiserror::Error;
 use tokio::sync::watch;
 use tracing::{info, trace};
@@ -70,6 +70,13 @@ pub struct SealedSegments {
     inner: BTreeMap<LogOffset, SegmentMeta>,
 }
 
+impl ops::Deref for SealedSegments {
+    type Target = BTreeMap<LogOffset, SegmentMeta>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
 impl FromIterator<SegmentMeta> for SealedSegments {
     fn from_iter<T: IntoIterator<Item = SegmentMeta>>(iter: T) -> Self {
         Self {
@@ -180,6 +187,36 @@ impl NodeShared {
         trace!(offset = alloc.offset.0, "Allocated new entry");
 
         alloc
+    }
+
+    pub fn get_first_unwritten_log_offset(&self) -> LogOffset {
+        let read_in_flight = self.entries_in_flight.read().expect("Locking failed");
+        read_in_flight
+            .unwritten
+            .iter()
+            .next()
+            .copied()
+            .unwrap_or(read_in_flight.next_available_log_offset)
+    }
+
+    pub fn get_first_unwritten_entry_offset_ge(
+        &self,
+        offset_inclusive: LogOffset,
+    ) -> Option<LogOffset> {
+        self.entries_in_flight
+            .read()
+            .expect("Locking failed")
+            .unwritten
+            .range(offset_inclusive..)
+            .next()
+            .copied()
+    }
+    pub fn get_sealed_segments_end_log_offset(&self) -> Option<LogOffset> {
+        self.sealed_segments
+            .read()
+            .expect("Locking failed")
+            .last_key_value()
+            .map(|(_, last_sealed_segment)| last_sealed_segment.content_meta.end_log_offset)
     }
 }
 
@@ -318,227 +355,198 @@ impl Node {
     }
 
     /*
-        pub fn get_ctrl(&self) -> NodeCtrl {
-            NodeCtrl {
-                is_node_shutting_down: Arc::clone(&self.is_node_shutting_down),
-                local_addr: self.local_addr,
+            pub fn get_ctrl(&self) -> NodeCtrl {
+                NodeCtrl {
+                    is_node_shutting_down: Arc::clone(&self.is_node_shutting_down),
+                    local_addr: self.local_addr,
+                }
+            }
+
+            pub async fn wait(self) -> Result<TcpListener, JoinError> {
+                let Self {
+                    write_loop,
+                    segment_preloading_loop,
+                    fsync_loop,
+                    request_handling_loop,
+                    ..
+                } = self;
+
+                write_loop.await?;
+                segment_preloading_loop.await?;
+                fsync_loop.await?;
+                let res = request_handling_loop.await;
+
+                info!("Node finished");
+
+                res
             }
         }
 
-        pub async fn wait(self) -> Result<TcpListener, JoinError> {
-            let Self {
-                write_loop,
-                segment_preloading_loop,
-                fsync_loop,
-                request_handling_loop,
-                ..
-            } = self;
-
-            write_loop.await?;
-            segment_preloading_loop.await?;
-            fsync_loop.await?;
-            let res = request_handling_loop.await;
-
-            info!("Node finished");
-
-            res
-        }
-    }
-
-    #[derive(Error, Debug)]
-    pub enum NodeError {
-        #[error("log store error")]
-        LogStore(#[from] ScanError),
-        #[error("io error")]
-        Io(#[from] io::Error),
-    }
-
-    pub type NodeResult<T> = std::result::Result<T, NodeError>;
-
-    impl NodeShared {
-        /// Get a vector from a pool of vectors
-        ///
-        /// This is to avoid allocating all the time.
-        /// TODO: Optimize. Is it even worth it? Should we spread
-        /// accross multiple size buckets and to spread the contention?
-        pub async fn pop_entry_buffer(self: &Arc<Self>) -> Vec<u8> {
-            self.entry_buffer_pool
-                .lock()
-                .await
-                .pop()
-                .unwrap_or_default()
+        #[derive(Error, Debug)]
+        pub enum NodeError {
+            #[error("log store error")]
+            LogStore(#[from] ScanError),
+            #[error("io error")]
+            Io(#[from] io::Error),
         }
 
-        // Return back a vector to a pool of vectors. See [`Self::pop_entry_buffer`].
-        pub async fn put_entry_buffer(self: &Arc<Self>, mut buf: Vec<u8>) {
-            // keep capacity, clear content
-            buf.clear();
-            self.entry_buffer_pool.lock().await.push(buf)
-        }
+        pub type NodeResult<T> = std::result::Result<T, NodeError>;
 
-        /// Allocate a space in the event stream and return allocation id
-        pub async fn allocate_new_entry(self: &Arc<Self>, len: EntrySize) -> AllocationId {
-            let mut write_in_flight = self.entries_in_flight.write().await;
+        impl NodeShared {
+            /// Get a vector from a pool of vectors
+            ///
+            /// This is to avoid allocating all the time.
+            /// TODO: Optimize. Is it even worth it? Should we spread
+            /// accross multiple size buckets and to spread the contention?
+            pub async fn pop_entry_buffer(self: &Arc<Self>) -> Vec<u8> {
+                self.entry_buffer_pool
+                    .lock()
+                    .await
+                    .pop()
+                    .unwrap_or_default()
+            }
 
-            let offset = write_in_flight.next_available_log_offset;
-            let was_inserted = write_in_flight.unwritten.insert(offset);
-            debug_assert!(was_inserted);
-            let alloc = AllocationId {
-                offset,
-                term: self.term,
-            };
+            // Return back a vector to a pool of vectors. See [`Self::pop_entry_buffer`].
+            pub async fn put_entry_buffer(self: &Arc<Self>, mut buf: Vec<u8>) {
+                // keep capacity, clear content
+                buf.clear();
+                self.entry_buffer_pool.lock().await.push(buf)
+            }
 
-            write_in_flight.next_available_log_offset = LogOffset(
-                offset.0 + EntryHeader::BYTE_SIZE_U64 + u64::from(len.0) + EntryTrailer::BYTE_SIZE_U64,
-            );
+            /// Allocate a space in the event stream and return allocation id
+            pub async fn allocate_new_entry(self: &Arc<Self>, len: EntrySize) -> AllocationId {
+                let mut write_in_flight = self.entries_in_flight.write().await;
 
-            trace!(offset = alloc.offset.0, "Allocated new entry");
+                let offset = write_in_flight.next_available_log_offset;
+                let was_inserted = write_in_flight.unwritten.insert(offset);
+                debug_assert!(was_inserted);
+                let alloc = AllocationId {
+                    offset,
+                    term: self.term,
+                };
 
-            alloc
-        }
+                write_in_flight.next_available_log_offset = LogOffset(
+                    offset.0 + EntryHeader::BYTE_SIZE_U64 + u64::from(len.0) + EntryTrailer::BYTE_SIZE_U64,
+                );
 
+                trace!(offset = alloc.offset.0, "Allocated new entry");
 
-        pub async fn get_first_unwritten_log_offset(self: &Arc<Self>) -> LogOffset {
-            let read_in_flight = self.entries_in_flight.read().await;
-            read_in_flight
-                .unwritten
-                .iter()
-                .next()
-                .copied()
-                .unwrap_or(read_in_flight.next_available_log_offset)
-        }
+                alloc
+            }
 
-        pub async fn get_first_unwritten_entry_offset_ge(
-            self: &Arc<Self>,
-            offset_inclusive: LogOffset,
-        ) -> Option<LogOffset> {
-            self.entries_in_flight
-                .read()
-                .await
-                .unwritten
-                .range(offset_inclusive..)
-                .next()
-                .copied()
-        }
+    */
+    /*
 
-        pub async fn get_sealed_segments_end_log_offset(self: &Arc<Self>) -> Option<LogOffset> {
-            self.sealed_segments
-                .read()
-                .await
-                .last_key_value()
-                .map(|(_, last_sealed_segment)| last_sealed_segment.content_meta.end_log_offset)
-        }
+    pub async fn run_fsync_loop(
+        self: Arc<Self>,
+        mut last_written_entry_log_offset_rx: watch::Receiver<LogOffset>,
+    ) {
+        let _guard = scopeguard::guard((), |_| {
+            info!("fsync loop is done");
+        });
+        loop {
+            // we don't care if the other side dropped - we will just keep fsyncing
+            // until done
+            let _ = last_written_entry_log_offset_rx.changed().await;
 
-        pub async fn run_fsync_loop(
-            self: Arc<Self>,
-            mut last_written_entry_log_offset_rx: watch::Receiver<LogOffset>,
-        ) {
-            let _guard = scopeguard::guard((), |_| {
-                info!("fsync loop is done");
-            });
-            loop {
-                // we don't care if the other side dropped - we will just keep fsyncing
-                // until done
-                let _ = last_written_entry_log_offset_rx.changed().await;
+            let first_unwritten_log_offset = self.get_first_unwritten_log_offset().await;
+            let fsynced_log_offset = self.fsynced_log_offset.load(Ordering::SeqCst);
 
-                let first_unwritten_log_offset = self.get_first_unwritten_log_offset().await;
-                let fsynced_log_offset = self.fsynced_log_offset.load(Ordering::SeqCst);
-
-                if fsynced_log_offset == first_unwritten_log_offset.0 {
-                    // if we're done with all the pending work, and the writting loop
-                    // is done too, we can finish
-                    if self.is_writting_loop_done.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    continue;
+            if fsynced_log_offset == first_unwritten_log_offset.0 {
+                // if we're done with all the pending work, and the writting loop
+                // is done too, we can finish
+                if self.is_writting_loop_done.load(Ordering::Relaxed) {
+                    return;
                 }
+                continue;
+            }
 
-                'inner: loop {
-                    let read_open_segments = self.open_segments.read().await;
+            'inner: loop {
+                let read_open_segments = self.open_segments.read().await;
 
-                    let mut segments_iter = read_open_segments.inner.iter();
-                    let first_segment = segments_iter
-                        .next()
-                        .map(|(offset, segment)| (*offset, Arc::clone(segment)));
-                    let second_segment_start = segments_iter.next().map(|s| s.0).cloned();
-                    drop(segments_iter);
-                    drop(read_open_segments);
+                let mut segments_iter = read_open_segments.inner.iter();
+                let first_segment = segments_iter
+                    .next()
+                    .map(|(offset, segment)| (*offset, Arc::clone(segment)));
+                let second_segment_start = segments_iter.next().map(|s| s.0).cloned();
+                drop(segments_iter);
+                drop(read_open_segments);
 
-                    if let Some((first_segment_start_log_offset, first_segment)) = first_segment {
-                        debug!(
-                            segment_id = %first_segment.id,
-                            segment_start_log_offset = first_segment_start_log_offset.0,
-                            first_unwritten_log_offset = first_unwritten_log_offset.0,
-                            "fsync"
-                        );
-                        if let Err(e) = first_segment.file.sync_data().await {
-                            warn!(error = %e, "Could not fsync opened segment file");
-                            break 'inner;
-                        }
+                if let Some((first_segment_start_log_offset, first_segment)) = first_segment {
+                    debug!(
+                        segment_id = %first_segment.id,
+                        segment_start_log_offset = first_segment_start_log_offset.0,
+                        first_unwritten_log_offset = first_unwritten_log_offset.0,
+                        "fsync"
+                    );
+                    if let Err(e) = first_segment.file.sync_data().await {
+                        warn!(error = %e, "Could not fsync opened segment file");
+                        break 'inner;
+                    }
 
-                        let first_segment_end_log_offset = match second_segment_start {
-                            Some(v) => v,
-                            // Until we have at lest two open segments, we won't close the first one.
-                            // It's not a big deal, and avoids having to calculate the end of first
-                            // segment.
-                            None => break 'inner,
-                        };
+                    let first_segment_end_log_offset = match second_segment_start {
+                        Some(v) => v,
+                        // Until we have at lest two open segments, we won't close the first one.
+                        // It's not a big deal, and avoids having to calculate the end of first
+                        // segment.
+                        None => break 'inner,
+                    };
 
-                        // Are all the pending writes to the first open segment complete? If so,
-                        // we can close and seal it.
-                        if first_segment_end_log_offset <= first_unwritten_log_offset {
-                            let first_segment_offset_size =
-                                first_segment_end_log_offset.0 - first_segment_start_log_offset.0;
-                            // Note: we append to sealed segments first, and remove from open segments second. This way
-                            // any readers looking for their data can't miss it between removal and addition.
-                            {
-                                let mut write_sealed_segments = self.sealed_segments.write().await;
-                                write_sealed_segments.insert(
-                                    first_segment_start_log_offset,
-                                    SegmentMeta {
-                                        file_meta: SegmentFileMeta::new(
+                    // Are all the pending writes to the first open segment complete? If so,
+                    // we can close and seal it.
+                    if first_segment_end_log_offset <= first_unwritten_log_offset {
+                        let first_segment_offset_size =
+                            first_segment_end_log_offset.0 - first_segment_start_log_offset.0;
+                        // Note: we append to sealed segments first, and remove from open segments second. This way
+                        // any readers looking for their data can't miss it between removal and addition.
+                        {
+                            let mut write_sealed_segments = self.sealed_segments.write().await;
+                            write_sealed_segments.insert(
+                                first_segment_start_log_offset,
+                                SegmentMeta {
+                                    file_meta: SegmentFileMeta::new(
+                                        first_segment.id,
+                                        first_segment_offset_size
+                                            + SegmentFileHeader::BYTE_SIZE_U64,
+                                        SegmentFileMeta::get_path(
+                                            &self.params.data_dir,
                                             first_segment.id,
-                                            first_segment_offset_size
-                                                + SegmentFileHeader::BYTE_SIZE_U64,
-                                            SegmentFileMeta::get_path(
-                                                &self.params.data_dir,
-                                                first_segment.id,
-                                            ),
                                         ),
-                                        content_meta: segment::SegmentContentMeta {
-                                            start_log_offset: first_segment_start_log_offset,
-                                            end_log_offset: first_segment_end_log_offset,
-                                        },
+                                    ),
+                                    content_meta: segment::SegmentContentMeta {
+                                        start_log_offset: first_segment_start_log_offset,
+                                        end_log_offset: first_segment_end_log_offset,
                                     },
-                                );
-                                drop(write_sealed_segments);
-                            }
-                            {
-                                let mut write_open_segments = self.open_segments.write().await;
-                                let removed = write_open_segments
-                                    .inner
-                                    .remove(&first_segment_start_log_offset);
-                                debug_assert!(removed.is_some());
-                            }
-                        } else {
-                            break 'inner;
+                                },
+                            );
+                            drop(write_sealed_segments);
                         }
-
-                        // continue 'inner - there might be more
+                        {
+                            let mut write_open_segments = self.open_segments.write().await;
+                            let removed = write_open_segments
+                                .inner
+                                .remove(&first_segment_start_log_offset);
+                            debug_assert!(removed.is_some());
+                        }
                     } else {
                         break 'inner;
                     }
-                }
 
-                // Only after successfully looping and fsyncing and/or closing all matching segments
-                // we update `last_fsynced_log_offset`
-                self.fsynced_log_offset
-                    .store(first_unwritten_log_offset.0, Ordering::SeqCst);
-                // we don't care if everyone disconnected
-                let _ = self
-                    .last_fsynced_log_offset_tx
-                    .send(first_unwritten_log_offset);
+                    // continue 'inner - there might be more
+                } else {
+                    break 'inner;
+                }
             }
+
+            // Only after successfully looping and fsyncing and/or closing all matching segments
+            // we update `last_fsynced_log_offset`
+            self.fsynced_log_offset
+                .store(first_unwritten_log_offset.0, Ordering::SeqCst);
+            // we don't care if everyone disconnected
+            let _ = self
+                .last_fsynced_log_offset_tx
+                .send(first_unwritten_log_offset);
         }
-        */
+    }
+    */
 }

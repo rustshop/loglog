@@ -1,14 +1,16 @@
 use std::{
+    collections::BTreeMap,
     fs::File,
-    io::Write,
-    os::fd::AsRawFd,
+    io::{self, ErrorKind, Write},
+    os::fd::{AsRawFd, RawFd},
     sync::{atomic::Ordering, Arc},
 };
 
+use convi::ExpectFrom;
 use loglogd_api::LogOffset;
 use nix::sys::uio::pwrite;
 use tokio::sync::watch;
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 
 use crate::{
     segment::{EntryWrite, OpenSegment, SegmentFileHeader},
@@ -91,7 +93,7 @@ impl WriteLoopInner {
         #[allow(clippy::as_conversions)]
         let res =
                 // Note: `slice` here seem to surrisingly use `capacity`, not `len`
-                loop { pwrite(segment.fd.as_raw_fd(), &entry[..entry_len], file_offset as i64)? };
+                pwrite_all(segment.fd.as_raw_fd(), file_offset, &entry);
 
         if let Err(e) = res {
             panic!("IO Error when writing log: {}, crashing immediately", e);
@@ -101,7 +103,7 @@ impl WriteLoopInner {
         // we don't care if the other side is still there
         let _ = last_written_entry_log_offset_tx.send(offset);
 
-        self.put_entry_buffer(entry);
+        self.shared.put_entry_buffer(entry);
 
         Ok(())
     }
@@ -149,7 +151,7 @@ impl WriteLoopInner {
             let last_segment_info = {
                 // Usually the segment to use should be one of the existing one,
                 // so lock the list for reading and clone the match if so.
-                let read_open_segments = self.open_segments.read().await;
+                let read_open_segments = self.shared.open_segments.read().expect("Locking failed");
 
                 if let Some(segment) =
                     get_segment_for_offset(&read_open_segments.inner, entry_log_offset)
@@ -177,14 +179,14 @@ impl WriteLoopInner {
                 // next segment as we might have arrived here out of order. Instead - we can use
                 // `unwritten` to find first unwritten entry for new segment, and thus its starting
                 // byte.
-                self.get_first_unwritten_entry_offset_ge(
-                    last_segment_info.end_of_allocation_log_offset,
-                )
-                .await
-                .expect("at very least this entry should be in `unwritten`")
+                self.shared
+                    .get_first_unwritten_entry_offset_ge(
+                        last_segment_info.end_of_allocation_log_offset,
+                    )
+                    .expect("at very least this entry should be in `unwritten`")
             } else {
-                self.get_sealed_segments_end_log_offset()
-                    .await
+                self.shared
+                    .get_sealed_segments_end_log_offset()
                     .unwrap_or(LogOffset(0))
             };
 
@@ -192,7 +194,8 @@ impl WriteLoopInner {
             // so potentially other threads can make write their stuff, and try to switch
             // to writes.
             let (new_segment_start_log_offset, new_segment) = {
-                let mut write_open_segments = self.open_segments.write().await;
+                let mut write_open_segments =
+                    self.shared.open_segments.write().expect("Locking failed");
 
                 // Check again if we still need to create new open segment. Things might have changed between unlock & write lock - some
                 // other thread might have done it before us. In such a case the last_segment we recorded, will be different now.
@@ -212,7 +215,6 @@ impl WriteLoopInner {
                     write_open_segments
                         .future_rx
                         .recv()
-                        .await
                         .expect("segment pre-writing thread must never disconnect"),
                 );
                 let prev = write_open_segments
@@ -231,12 +233,10 @@ impl WriteLoopInner {
                 (next_segment_start_log_offset, new_segment)
             };
 
-            self.put_entry_buffer(
+            self.shared.put_entry_buffer(
                 new_segment
-                    .write_header(new_segment_start_log_offset, self.pop_entry_buffer().await)
-                    .await,
-            )
-            .await;
+                    .write_header(new_segment_start_log_offset, self.shared.pop_entry_buffer()),
+            );
 
             // It would be tempting to just return the `new_segment` as the segment we need. But that would be
             // a mistake - this entry might theoretically be so far ahead, that it needs even more segments opened.
@@ -244,9 +244,32 @@ impl WriteLoopInner {
         }
     }
 
-    pub async fn mark_entry_written(self: &Arc<Self>, log_offset: LogOffset) {
-        let mut write_in_flight = self.entries_in_flight.write().await;
+    pub fn mark_entry_written(self: &Arc<Self>, log_offset: LogOffset) {
+        let mut write_in_flight = self
+            .shared
+            .entries_in_flight
+            .write()
+            .expect("Locking failed");
         let was_removed = write_in_flight.unwritten.remove(&log_offset);
         debug_assert!(was_removed);
     }
+}
+
+fn pwrite_all(fd: RawFd, mut file_offset: u64, mut buf: &[u8]) -> io::Result<()> {
+    while !buf.is_empty() {
+        match pwrite(fd, buf, i64::expect_from(file_offset)) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ));
+            }
+            Ok(written) => {
+                buf = &buf[written..];
+                file_offset += u64::expect_from(written);
+            }
+            Err(_) => todo!(),
+        }
+    }
+    Ok(())
 }
