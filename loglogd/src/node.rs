@@ -1,13 +1,14 @@
-// mod request_handling;
-// mod segment_preloading;
-
 mod request_handler;
-mod write_loop;
+mod segment_preallocator;
+mod segment_sealer;
+mod segment_writer;
 
 use crate::db::{load_db, ScanError};
 use crate::node::request_handler::RequestHandler;
-use crate::node::write_loop::WriteLoop;
-use crate::segment::{OpenSegment, SegmentMeta};
+use crate::node::segment_preallocator::SegmentPreallocator;
+use crate::node::segment_sealer::SegmentSealer;
+use crate::node::segment_writer::SegmentWriter;
+use crate::segment::{OpenSegment, PreallocatedSegment, SegmentMeta};
 use loglogd_api::{AllocationId, EntryHeader, EntrySize, EntryTrailer, LogOffset, NodeId, TermId};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -50,8 +51,8 @@ pub struct OpenSegments {
     /// The outter lock is only for adding/removing elements
     /// from this vector, and `future_rx`.
     inner: BTreeMap<LogOffset, Arc<OpenSegment>>,
-    /// Segment pre-writing thread will keep sending us new threads through this
-    future_rx: flume::Receiver<OpenSegment>,
+    /// Segment pre-allocator will keep sending us new threads through this
+    preallocated_segments_rx: flume::Receiver<PreallocatedSegment>,
 }
 
 impl OpenSegments {
@@ -77,6 +78,13 @@ impl ops::Deref for SealedSegments {
         &self.inner
     }
 }
+
+impl ops::DerefMut for SealedSegments {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
 impl FromIterator<SegmentMeta> for SealedSegments {
     fn from_iter<T: IntoIterator<Item = SegmentMeta>>(iter: T) -> Self {
         Self {
@@ -238,16 +246,21 @@ impl NodeCtrl {
 pub struct Node {
     is_node_shutting_down: Arc<AtomicBool>,
     local_addr: SocketAddr,
+    /// Thread preallocating new segments in parallel
+    #[allow(unused)]
+    segment_preallocator: SegmentPreallocator,
+    /// Tokio executor running a tcp connection handling
+    #[allow(unused)]
     request_handler: RequestHandler,
-    // local_addr: SocketAddr,
-    // write_loop: tokio::task::JoinHandle<()>,
-    // segment_preloading_loop: tokio::task::JoinHandle<()>,
-    // fsync_loop: tokio::task::JoinHandle<()>,
-    // request_handling_loop: tokio::task::JoinHandle<TcpListener>,
+    /// Thread(s) handling writting out received entries to storage
+    #[allow(unused)]
+    segment_writer: SegmentWriter,
+    #[allow(unused)]
+    segment_sealer: SegmentSealer,
 }
 
 impl Node {
-    pub async fn new(listen_addr: SocketAddr, params: Parameters) -> anyhow::Result<Self> {
+    pub fn new(listen_addr: SocketAddr, params: Parameters) -> anyhow::Result<Self> {
         info!(
             listen = %listen_addr,
             "data-dir" = %params.data_dir.display(),
@@ -302,7 +315,7 @@ impl Node {
             sealed_segments: RwLock::new(SealedSegments::from_iter(segments)),
             open_segments: RwLock::new(OpenSegments {
                 inner: BTreeMap::new(),
-                future_rx: future_segments_rx,
+                preallocated_segments_rx: future_segments_rx,
             }),
             fsynced_log_offset: AtomicU64::new(0),
             last_fsynced_log_offset_tx,
@@ -314,72 +327,42 @@ impl Node {
             entry_writer_tx,
             last_fsynced_log_offset_rx,
         )?;
+        let local_addr = request_handler.local_addr();
 
-        let write_loop = WriteLoop::new(
+        let segment_writer = SegmentWriter::new(
             shared.clone(),
             entry_writer_rx,
             last_written_entry_log_offset_tx,
         );
-        let local_addr = request_handler.local_addr();
-        Ok(Node {
-            request_handler,
-            local_addr,
-            // write_loop: tokio_uring::spawn(
-            //     shared
-            //         .clone()
-            //         .run_entry_write_loop(entry_writer_rx, last_written_entry_log_offset_tx),
-            // ),
-            // segment_preloading_loop: tokio_uring::spawn(
-            //     SegmentPreloading {
-            //         params,
-            //         tx: future_segments_tx,
-            //     }
-            //     .run_segment_preloading_loop(next_segment_id),
-            // ),
 
-            // fsync_loop: tokio_uring::spawn(
-            //     shared
-            //         .clone()
-            //         .run_fsync_loop(last_written_entry_log_offset_rx),
-            // ),
-            // request_handling_loop: tokio_uring::spawn(
-            //     RequestHandler {
-            //         shared,
-            //         last_fsynced_log_offset_rx,
-            //         is_node_shutting_down: is_node_shutting_down.clone(),
-            //     }
-            //     .run_request_handling_loop(listener, entry_writer_tx),
-            // ),
+        let segment_sealer = SegmentSealer::new(shared, last_written_entry_log_offset_rx);
+
+        let segment_preallocator =
+            SegmentPreallocator::new(next_segment_id, params, future_segments_tx);
+
+        Ok(Node {
+            local_addr,
+            segment_preallocator,
+            request_handler,
+            segment_writer,
+            segment_sealer,
             is_node_shutting_down,
         })
     }
 
+    pub fn get_ctrl(&self) -> NodeCtrl {
+        NodeCtrl {
+            is_node_shutting_down: Arc::clone(&self.is_node_shutting_down),
+            local_addr: self.local_addr,
+        }
+    }
+
+    // TODO: pub async fn wait(self) -> Result<TcpListener, JoinError> {
+    pub fn wait(self) {
+        drop(self);
+        info!("Node finished");
+    }
     /*
-            pub fn get_ctrl(&self) -> NodeCtrl {
-                NodeCtrl {
-                    is_node_shutting_down: Arc::clone(&self.is_node_shutting_down),
-                    local_addr: self.local_addr,
-                }
-            }
-
-            pub async fn wait(self) -> Result<TcpListener, JoinError> {
-                let Self {
-                    write_loop,
-                    segment_preloading_loop,
-                    fsync_loop,
-                    request_handling_loop,
-                    ..
-                } = self;
-
-                write_loop.await?;
-                segment_preloading_loop.await?;
-                fsync_loop.await?;
-                let res = request_handling_loop.await;
-
-                info!("Node finished");
-
-                res
-            }
         }
 
         #[derive(Error, Debug)]
@@ -437,116 +420,5 @@ impl Node {
     */
     /*
 
-    pub async fn run_fsync_loop(
-        self: Arc<Self>,
-        mut last_written_entry_log_offset_rx: watch::Receiver<LogOffset>,
-    ) {
-        let _guard = scopeguard::guard((), |_| {
-            info!("fsync loop is done");
-        });
-        loop {
-            // we don't care if the other side dropped - we will just keep fsyncing
-            // until done
-            let _ = last_written_entry_log_offset_rx.changed().await;
-
-            let first_unwritten_log_offset = self.get_first_unwritten_log_offset().await;
-            let fsynced_log_offset = self.fsynced_log_offset.load(Ordering::SeqCst);
-
-            if fsynced_log_offset == first_unwritten_log_offset.0 {
-                // if we're done with all the pending work, and the writting loop
-                // is done too, we can finish
-                if self.is_writting_loop_done.load(Ordering::Relaxed) {
-                    return;
-                }
-                continue;
-            }
-
-            'inner: loop {
-                let read_open_segments = self.open_segments.read().await;
-
-                let mut segments_iter = read_open_segments.inner.iter();
-                let first_segment = segments_iter
-                    .next()
-                    .map(|(offset, segment)| (*offset, Arc::clone(segment)));
-                let second_segment_start = segments_iter.next().map(|s| s.0).cloned();
-                drop(segments_iter);
-                drop(read_open_segments);
-
-                if let Some((first_segment_start_log_offset, first_segment)) = first_segment {
-                    debug!(
-                        segment_id = %first_segment.id,
-                        segment_start_log_offset = first_segment_start_log_offset.0,
-                        first_unwritten_log_offset = first_unwritten_log_offset.0,
-                        "fsync"
-                    );
-                    if let Err(e) = first_segment.file.sync_data().await {
-                        warn!(error = %e, "Could not fsync opened segment file");
-                        break 'inner;
-                    }
-
-                    let first_segment_end_log_offset = match second_segment_start {
-                        Some(v) => v,
-                        // Until we have at lest two open segments, we won't close the first one.
-                        // It's not a big deal, and avoids having to calculate the end of first
-                        // segment.
-                        None => break 'inner,
-                    };
-
-                    // Are all the pending writes to the first open segment complete? If so,
-                    // we can close and seal it.
-                    if first_segment_end_log_offset <= first_unwritten_log_offset {
-                        let first_segment_offset_size =
-                            first_segment_end_log_offset.0 - first_segment_start_log_offset.0;
-                        // Note: we append to sealed segments first, and remove from open segments second. This way
-                        // any readers looking for their data can't miss it between removal and addition.
-                        {
-                            let mut write_sealed_segments = self.sealed_segments.write().await;
-                            write_sealed_segments.insert(
-                                first_segment_start_log_offset,
-                                SegmentMeta {
-                                    file_meta: SegmentFileMeta::new(
-                                        first_segment.id,
-                                        first_segment_offset_size
-                                            + SegmentFileHeader::BYTE_SIZE_U64,
-                                        SegmentFileMeta::get_path(
-                                            &self.params.data_dir,
-                                            first_segment.id,
-                                        ),
-                                    ),
-                                    content_meta: segment::SegmentContentMeta {
-                                        start_log_offset: first_segment_start_log_offset,
-                                        end_log_offset: first_segment_end_log_offset,
-                                    },
-                                },
-                            );
-                            drop(write_sealed_segments);
-                        }
-                        {
-                            let mut write_open_segments = self.open_segments.write().await;
-                            let removed = write_open_segments
-                                .inner
-                                .remove(&first_segment_start_log_offset);
-                            debug_assert!(removed.is_some());
-                        }
-                    } else {
-                        break 'inner;
-                    }
-
-                    // continue 'inner - there might be more
-                } else {
-                    break 'inner;
-                }
-            }
-
-            // Only after successfully looping and fsyncing and/or closing all matching segments
-            // we update `last_fsynced_log_offset`
-            self.fsynced_log_offset
-                .store(first_unwritten_log_offset.0, Ordering::SeqCst);
-            // we don't care if everyone disconnected
-            let _ = self
-                .last_fsynced_log_offset_tx
-                .send(first_unwritten_log_offset);
-        }
-    }
     */
 }

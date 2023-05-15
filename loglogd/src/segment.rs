@@ -1,8 +1,8 @@
-use crate::ioutil::vec_extend_to_at_least;
+use crate::ioutil::{pwrite_all, vec_extend_to_at_least};
 use std::{
     fmt,
     fs::OpenOptions,
-    io::{BufReader, Cursor, Seek, Write},
+    io::{BufReader, Cursor, Seek},
     os::fd::{AsRawFd, OwnedFd},
     path::{Path, PathBuf},
 };
@@ -90,7 +90,7 @@ pub struct SegmentFileMeta {
     pub id: SegmentId,
 
     /// Path to a segment file, to avoid allocating to calculate it during normal operations
-    path: PathBuf,
+    pub path: PathBuf,
 
     /// File length
     pub file_len: u64,
@@ -134,20 +134,17 @@ pub struct EntryWrite {
 }
 
 #[derive(Debug)]
-pub struct OpenSegment {
+pub struct PreallocatedSegment {
     pub id: SegmentId,
     pub fd: OwnedFd,
     pub allocated_size: u64,
-    // The position in the stream of the first entry stored in this file
-    pub start_log_offset: LogOffset,
 }
 
-impl OpenSegment {
-    pub async fn create_and_fallocate(
+impl PreallocatedSegment {
+    pub fn create_and_fallocate(
         path: &Path,
         id: SegmentId,
         allocated_size: u64,
-        start_log_offset: LogOffset,
     ) -> io::Result<Self> {
         trace!(path = %path.display(), "Creating new segment file");
         let file = OpenOptions::new()
@@ -169,11 +166,30 @@ impl OpenSegment {
             id,
             fd,
             allocated_size,
-            start_log_offset,
         })
     }
 
-    pub fn write_header(&self, log_offset: LogOffset, mut buf: Vec<u8>) -> Vec<u8> {
+    pub fn finalize(self, start_log_offset: LogOffset) -> OpenSegment {
+        OpenSegment {
+            id: self.id,
+            fd: self.fd,
+            allocated_size: self.allocated_size,
+            start_log_offset,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct OpenSegment {
+    pub id: SegmentId,
+    pub fd: OwnedFd,
+    pub allocated_size: u64,
+    // The position in the stream of the first entry stored in this file
+    pub start_log_offset: LogOffset,
+}
+
+impl OpenSegment {
+    pub fn write_file_header(&self, log_offset: LogOffset, mut buf: Vec<u8>) -> Vec<u8> {
         vec_extend_to_at_least(&mut buf, SegmentFileHeader::BYTE_SIZE);
 
         let header = SegmentFileHeader {
@@ -186,10 +202,7 @@ impl OpenSegment {
             .write(&mut Cursor::new(&mut buf))
             .expect("can't fail");
 
-        // let (res, res_buf) =
-        //     file_write_all(&self.file, buf.slice(..SegmentFileHeader::BYTE_SIZE), 0).await;
-
-        let res = std::fs::File::from(self.fd).write_all(&buf[..SegmentFileHeader::BYTE_SIZE]);
+        let res = pwrite_all(self.fd.as_raw_fd(), 0, &buf[..SegmentFileHeader::BYTE_SIZE]);
 
         if let Err(e) = res {
             panic!("IO Error when writting log: {}, crashing immediately", e);
@@ -208,8 +221,8 @@ pub struct SegmentParseError<R> {
     // /// Last valid file position
     // file_pos: u64,
     #[source]
-    r#type: SegmentParseErrorType,
-    res: R,
+    pub r#type: SegmentParseErrorType,
+    pub res: R,
 }
 
 pub type SegmentParseResult<O, R> = std::result::Result<O, SegmentParseError<R>>;
@@ -245,7 +258,7 @@ impl SegmentFileMeta {
     }
 }
 
-struct SegmentContentRecoveredInfo {
+pub struct SegmentContentRecoveredInfo {
     pub content_meta: Option<SegmentContentMeta>,
     pub truncate_size: u64,
     pub error_offset: u64,

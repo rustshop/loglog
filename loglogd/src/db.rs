@@ -31,7 +31,7 @@ fn scan_segments(data_dir: &Path) -> ScanResult<Vec<SegmentFileMeta>> {
     }
     let mut segments = vec![];
 
-    for entry in std::fs::read_dir(&data_dir).map_err(ScanError::CanNotList)? {
+    for entry in std::fs::read_dir(data_dir).map_err(ScanError::CanNotList)? {
         let entry = entry?;
 
         let path = entry.path();
@@ -70,18 +70,18 @@ fn scan_segments(data_dir: &Path) -> ScanResult<Vec<SegmentFileMeta>> {
             })?
             .into();
 
-        segments.push(SegmentFileMeta {
+        segments.push(SegmentFileMeta::new(
             id,
-            file_len: metadata.len(),
-            path: SegmentFileMeta::get_path(&data_dir, id),
-        });
+            metadata.len(),
+            SegmentFileMeta::get_path(data_dir, id),
+        ));
     }
 
     Ok(segments)
 }
 
 pub fn load_db(data_dir: &Path) -> ScanResult<Vec<SegmentMeta>> {
-    std::fs::create_dir_all(&data_dir)?;
+    std::fs::create_dir_all(data_dir)?;
 
     let mut files_meta = scan_segments(data_dir)?;
 

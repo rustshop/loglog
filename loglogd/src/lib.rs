@@ -6,3 +6,5 @@ mod node;
 mod segment;
 
 mod task;
+
+pub use node::*;

@@ -1,11 +1,10 @@
 #![deny(clippy::as_conversions)]
+use loglogd::Parameters;
 use opts::Opts;
-use std::error::Error;
 use std::io;
-use tokio::signal;
-use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+mod ioutil;
 mod opts;
 
 fn main() -> anyhow::Result<()> {
@@ -21,16 +20,16 @@ fn main() -> anyhow::Result<()> {
         params.base_segment_file_size(Parameters::DEFAULT_BASE_SEGMENT_SIZE)
     };
 
-    let node = loglogd::Node::new(opts.listen, params.build()).await?;
+    let node = loglogd::Node::new(opts.listen, params.build())?;
 
-    let node_ctrl = node.get_ctrl();
+    let _node_ctrl = node.get_ctrl();
     // tokio_uring::spawn(async move {
     //     wait_for_shutdown_signal().await;
     //     info!("signal received, starting graceful shutdown");
     //     node_ctrl.stop();
     // });
 
-    node.wait().await?;
+    node.wait();
 
     Ok(())
 }

@@ -45,13 +45,11 @@ pub enum ConnectionError {
     JoinError(#[from] tokio::task::JoinError),
 }
 
-pub type RingConnectionResult<T> = (ConnectionResult<T>, Vec<u8>);
-
 pub type ConnectionResult<T> = std::result::Result<T, ConnectionError>;
 
 pub struct RequestHandler {
-    inner: Arc<RequestHandlerInner>,
     local_addr: SocketAddr,
+    #[allow(unused)]
     join_handle: AutoJoinHandle,
 }
 
@@ -68,29 +66,25 @@ impl RequestHandler {
             last_fsynced_log_offset_rx,
         });
 
-        // let entry_writer_tx = Arc::new(entry_writer_tx);
-
         let rt = tokio::runtime::Runtime::new()?;
 
         let (tx, rx) = flume::bounded(1);
 
-        let join_handle = AutoJoinHandle::spawn_res({
-            let inner = inner.clone();
-            move || -> Result<(), io::Error> {
-                rt.block_on(async {
-                    let _guard = scopeguard::guard((), |_| {
-                        info!("request handling loop is done");
-                    });
+        let join_handle = AutoJoinHandle::spawn_res(move || -> Result<(), io::Error> {
+            rt.block_on(async {
+                let _guard = scopeguard::guard((), |_| {
+                    info!("request handling loop is done");
+                });
 
-                    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+                let listener = tokio::net::TcpListener::bind(listen_addr).await?;
 
-                    tx.send(listener.local_addr()?);
+                tx.send(listener.local_addr()?)
+                    .expect("local_addr rx not there?");
 
-                    inner.handle_requests(listener).await;
+                inner.handle_requests(listener).await;
 
-                    Ok(())
-                })
-            }
+                Ok(())
+            })
         });
 
         let local_addr = rx.recv()?;
@@ -98,7 +92,6 @@ impl RequestHandler {
         Ok(Self {
             join_handle,
             local_addr,
-            inner,
         })
     }
 
