@@ -11,7 +11,7 @@ use binrw::{io, BinRead, BinWrite};
 use loglogd_api::{EntryHeader, EntryTrailer, LogOffset};
 use nix::fcntl::FallocateFlags;
 use thiserror::Error;
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 // use crate::ioutil::{file_write_all, vec_extend_to_at_least};
 
@@ -45,6 +45,7 @@ impl SegmentFileHeader {
     #[allow(unused)]
     pub const BYTE_SIZE: usize = 1 + 8 + 1;
     pub const BYTE_SIZE_U64: u64 = 1 + 8 + 1;
+    pub const VERSION_INVALID: u8 = 0;
 }
 
 /// Information about a segement
@@ -231,6 +232,8 @@ pub type SegmentParseResult<O, R> = std::result::Result<O, SegmentParseError<R>>
 pub enum SegmentParseErrorType {
     #[error("io")]
     Io(#[from] io::Error),
+    #[error("file empty")]
+    FileEmpty,
     #[error("file truncated")]
     FileTruncated,
     #[error("invalid file header")]
@@ -274,7 +277,6 @@ impl SegmentContentMeta {
     pub fn read_from_file(
         file_meta: &SegmentFileMeta,
         file: &std::fs::File,
-        path: &Path,
     ) -> io::Result<SegmentParseResult<SegmentContentMeta, SegmentContentRecoveredInfo>> {
         if file_meta.file_len < SegmentFileHeader::BYTE_SIZE_U64 {
             return Ok(Err(SegmentParseErrorType::FileTruncated.into_error(
@@ -286,11 +288,39 @@ impl SegmentContentMeta {
             )));
         }
         let mut reader = BufReader::new(file);
-        let header = match SegmentFileHeader::read(&mut reader).map_err(|e| {
-            warn!("could not read segment header: {}", path.display());
-            e
-        }) {
-            Ok(o) => o,
+        let header = match SegmentFileHeader::read(&mut reader) {
+            Ok(o) => {
+                if o.version == SegmentFileHeader::VERSION_INVALID {
+                    return Ok(Err(SegmentParseErrorType::FileTruncated.into_error(
+                        SegmentContentRecoveredInfo {
+                            content_meta: None,
+                            truncate_size: 0,
+                            error_offset: 0,
+                        },
+                    )));
+                } else {
+                    o
+                }
+            }
+            Err(binrw::Error::AssertFail { pos, message }) => {
+                if pos == 0 {
+                    return Ok(Err(SegmentParseErrorType::FileEmpty.into_error(
+                        SegmentContentRecoveredInfo {
+                            content_meta: None,
+                            truncate_size: 0,
+                            error_offset: 0,
+                        },
+                    )));
+                }
+                return Ok(Err(SegmentParseErrorType::InvalidFileHeader(
+                    binrw::Error::AssertFail { pos, message },
+                )
+                .into_error(SegmentContentRecoveredInfo {
+                    content_meta: None,
+                    truncate_size: 0,
+                    error_offset: file_meta.file_len,
+                })));
+            }
             Err(binrw::Error::Io(e)) => return Err(e),
             Err(e) => {
                 return Ok(Err(SegmentParseErrorType::InvalidFileHeader(e).into_error(
@@ -364,6 +394,9 @@ impl SegmentContentMeta {
                             //     "File truncated at file offset: {}",
                             //     file_pos + u64::try_from(error_offset).expect("can't fail"),
                             // );
+                            return Ok(Err(e.into_error(res)));
+                        }
+                        e @ SegmentParseErrorType::FileEmpty => {
                             return Ok(Err(e.into_error(res)));
                         }
                         SegmentParseErrorType::InvalidFileHeader(_) => {

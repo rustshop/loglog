@@ -10,6 +10,8 @@ use crate::node::segment_sealer::SegmentSealer;
 use crate::node::segment_writer::SegmentWriter;
 use crate::segment::{OpenSegment, PreallocatedSegment, SegmentMeta};
 use loglogd_api::{AllocationId, EntryHeader, EntrySize, EntryTrailer, LogOffset, NodeId, TermId};
+use signal_hook::consts::TERM_SIGNALS;
+use signal_hook::flag;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -18,8 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, RwLock};
 use std::{io, ops};
 use thiserror::Error;
-use tokio::sync::watch;
-use tracing::{info, trace};
+use tracing::{debug, info, trace};
 use typed_builder::TypedBuilder;
 
 /// Some parameters of runtime operation
@@ -127,9 +128,9 @@ pub type NodeResult<T> = std::result::Result<T, NodeError>;
 pub struct NodeShared {
     params: Parameters,
 
-    is_node_shutting_down: AtomicBool,
+    is_node_shutting_down: Arc<AtomicBool>,
 
-    is_writting_loop_done: AtomicBool,
+    is_segment_writer_done: AtomicBool,
 
     #[allow(unused)]
     id: NodeId,
@@ -241,10 +242,19 @@ impl NodeCtrl {
     pub fn stop(&self) {
         self.is_node_shutting_down.store(true, Ordering::SeqCst);
     }
+    pub fn install_signal_handler(&self) -> anyhow::Result<()> {
+        debug!("Installing signal handler");
+        for sig in TERM_SIGNALS {
+            trace!(sig, "Installing signal handler");
+            flag::register(*sig, Arc::clone(&self.is_node_shutting_down))?;
+        }
+        Ok(())
+    }
 }
 
 pub struct Node {
     is_node_shutting_down: Arc<AtomicBool>,
+    stop_on_drop: bool,
     local_addr: SocketAddr,
     /// Thread preallocating new segments in parallel
     #[allow(unused)]
@@ -257,6 +267,14 @@ pub struct Node {
     segment_writer: SegmentWriter,
     #[allow(unused)]
     segment_sealer: SegmentSealer,
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        if self.stop_on_drop {
+            self.is_node_shutting_down.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 impl Node {
@@ -299,8 +317,8 @@ impl Node {
 
         let is_node_shutting_down = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(NodeShared {
-            is_writting_loop_done: AtomicBool::new(false),
-            is_node_shutting_down: AtomicBool::new(false),
+            is_segment_writer_done: AtomicBool::new(false),
+            is_node_shutting_down: is_node_shutting_down.clone(),
             id: NodeId(0),
             term: TermId(0),
             entry_buffer_pool: Mutex::new(vec![]),
@@ -341,6 +359,7 @@ impl Node {
             SegmentPreallocator::new(next_segment_id, params, future_segments_tx);
 
         Ok(Node {
+            stop_on_drop: true,
             local_addr,
             segment_preallocator,
             request_handler,
@@ -357,68 +376,9 @@ impl Node {
         }
     }
 
-    // TODO: pub async fn wait(self) -> Result<TcpListener, JoinError> {
-    pub fn wait(self) {
+    pub fn wait(mut self) {
+        self.stop_on_drop = false;
         drop(self);
         info!("Node finished");
     }
-    /*
-        }
-
-        #[derive(Error, Debug)]
-        pub enum NodeError {
-            #[error("log store error")]
-            LogStore(#[from] ScanError),
-            #[error("io error")]
-            Io(#[from] io::Error),
-        }
-
-        pub type NodeResult<T> = std::result::Result<T, NodeError>;
-
-        impl NodeShared {
-            /// Get a vector from a pool of vectors
-            ///
-            /// This is to avoid allocating all the time.
-            /// TODO: Optimize. Is it even worth it? Should we spread
-            /// accross multiple size buckets and to spread the contention?
-            pub async fn pop_entry_buffer(self: &Arc<Self>) -> Vec<u8> {
-                self.entry_buffer_pool
-                    .lock()
-                    .await
-                    .pop()
-                    .unwrap_or_default()
-            }
-
-            // Return back a vector to a pool of vectors. See [`Self::pop_entry_buffer`].
-            pub async fn put_entry_buffer(self: &Arc<Self>, mut buf: Vec<u8>) {
-                // keep capacity, clear content
-                buf.clear();
-                self.entry_buffer_pool.lock().await.push(buf)
-            }
-
-            /// Allocate a space in the event stream and return allocation id
-            pub async fn allocate_new_entry(self: &Arc<Self>, len: EntrySize) -> AllocationId {
-                let mut write_in_flight = self.entries_in_flight.write().await;
-
-                let offset = write_in_flight.next_available_log_offset;
-                let was_inserted = write_in_flight.unwritten.insert(offset);
-                debug_assert!(was_inserted);
-                let alloc = AllocationId {
-                    offset,
-                    term: self.term,
-                };
-
-                write_in_flight.next_available_log_offset = LogOffset(
-                    offset.0 + EntryHeader::BYTE_SIZE_U64 + u64::from(len.0) + EntryTrailer::BYTE_SIZE_U64,
-                );
-
-                trace!(offset = alloc.offset.0, "Allocated new entry");
-
-                alloc
-            }
-
-    */
-    /*
-
-    */
 }

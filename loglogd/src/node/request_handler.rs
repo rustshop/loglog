@@ -33,8 +33,6 @@ use super::NodeShared;
 
 #[derive(Error, Debug)]
 pub enum ConnectionError {
-    #[error("disconnected")]
-    Disconected,
     #[error("invalid data")]
     Invalid,
     #[error("invalid data: {0}")]
@@ -71,11 +69,10 @@ impl RequestHandler {
         let (tx, rx) = flume::bounded(1);
 
         let join_handle = AutoJoinHandle::spawn_res(move || -> Result<(), io::Error> {
-            rt.block_on(async {
-                let _guard = scopeguard::guard((), |_| {
-                    info!("request handling loop is done");
-                });
-
+            let _guard = scopeguard::guard((), |_| {
+                info!("RequestHandler is done");
+            });
+            let res: Result<(), io::Error> = rt.block_on(async {
                 let listener = tokio::net::TcpListener::bind(listen_addr).await?;
 
                 tx.send(listener.local_addr()?)
@@ -84,7 +81,14 @@ impl RequestHandler {
                 inner.handle_requests(listener).await;
 
                 Ok(())
-            })
+            });
+
+            res?;
+
+            info!("Waiting for RequestHandler to complete all connections...");
+            rt.shutdown_timeout(Duration::from_secs(60));
+
+            Ok(())
         });
 
         let local_addr = rx.recv()?;
@@ -109,7 +113,7 @@ pub struct RequestHandlerInner {
 impl RequestHandlerInner {
     async fn handle_requests(self: &Arc<Self>, listener: TcpListener) {
         while !self.shared.is_node_shutting_down.load(Ordering::Relaxed) {
-            let (mut stream, _peer_addr) =
+            let (mut stream, peer_addr) =
                 // bound by a timeout, so we can exit after `is_stopped` is set in a reasonable time
                 match timeout(Duration::from_millis(500), listener.accept()).await {
                     Ok(Ok(o)) => o,
@@ -123,6 +127,8 @@ impl RequestHandlerInner {
                         continue;
                     }
                 };
+
+            info!(%peer_addr, "New peer connection");
 
             let self_copy = self.clone();
             tokio::spawn({

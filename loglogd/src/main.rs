@@ -1,11 +1,12 @@
 #![deny(clippy::as_conversions)]
+
+mod ioutil;
+mod opts;
+
 use loglogd::Parameters;
 use opts::Opts;
 use std::io;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-mod ioutil;
-mod opts;
 
 fn main() -> anyhow::Result<()> {
     init_logging();
@@ -22,12 +23,8 @@ fn main() -> anyhow::Result<()> {
 
     let node = loglogd::Node::new(opts.listen, params.build())?;
 
-    let _node_ctrl = node.get_ctrl();
-    // tokio_uring::spawn(async move {
-    //     wait_for_shutdown_signal().await;
-    //     info!("signal received, starting graceful shutdown");
-    //     node_ctrl.stop();
-    // });
+    let node_ctrl = node.get_ctrl();
+    node_ctrl.install_signal_handler()?;
 
     node.wait();
 

@@ -132,7 +132,7 @@ pub fn open_and_recover(
         // just in case we need to truncate
         .write(true)
         .open(&path)?;
-    match SegmentContentMeta::read_from_file(file_meta, &file, &path)? {
+    match SegmentContentMeta::read_from_file(file_meta, &file)? {
         Ok(o) => {
             debug!(start_log_offset = o.start_log_offset.0, end_log_offset = o.end_log_offset.0, path = ?path.display(), "segment file cleanly opened");
             Ok(Some(o))
@@ -157,7 +157,7 @@ pub fn open_and_recover(
                     path = ?path.display(),
                     error = ?type_,
                     error_file_offset = res.error_offset,
-                    "removing segment file with no existing entries"
+                    "Removing segment file with no existing entries"
                 );
                 std::fs::remove_file(path)?;
                 Ok(None)

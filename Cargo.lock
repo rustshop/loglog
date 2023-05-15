@@ -512,11 +512,13 @@ dependencies = [
  "nix",
  "num_enum",
  "scopeguard",
+ "signal-hook",
  "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "typed-builder",
+ "watch",
 ]
 
 [[package]]
@@ -915,6 +917,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "signal-hook"
+version = "0.3.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "732768f1176d21d09e076c23a93123d40bba92d50c4058da34d45c8de8e682b9"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
 name = "signal-hook-registry"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1232,6 +1244,12 @@ name = "wasm-bindgen-shared"
 version = "0.2.84"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0046fef7e28c3804e5e38bfa31ea2a0f73905319b677e57ebe37e49358989b5d"
+
+[[package]]
+name = "watch"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40b2a1d95f504bd0d3b08b211f9e626a0ae6537c838a9de0a1696e359242d339"
 
 [[package]]
 name = "winapi"

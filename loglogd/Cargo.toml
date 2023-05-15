@@ -37,4 +37,6 @@ loglogd-api = { path = "../api" }
 convi = { version = "0.0.4", features = [ "min_target_pointer_width_32" ] }
 atty = "*"
 futures = "*"
+signal-hook = "0.3.15"
 scopeguard = "1.1.0"
+watch = "0.2.2"
