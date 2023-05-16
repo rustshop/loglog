@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use binrw::io::NoSeek;
 use binrw::{BinRead, BinWrite};
 use convi::{CastFrom, ExpectFrom};
 use loglogd_api::{
@@ -89,19 +90,22 @@ impl Client for RawClient {
     /// Append an entry, without waiting for it to get commited in the log
     async fn append_nocommit(&mut self, raw_entry: &[u8]) -> Result<LogOffset> {
         debug!(size = raw_entry.len(), "Appending new entry");
-        let mut cmd_buf = [0u8; REQUEST_HEADER_SIZE];
 
-        let mut cursor = Cursor::new(&mut cmd_buf[0..]);
+        let mut buf = Vec::with_capacity(REQUEST_HEADER_SIZE + raw_entry.len());
 
-        std::io::Write::write_all(&mut cursor, &[RequestHeaderCmd::Append.into()])
+        std::io::Write::write_all(&mut buf, &[RequestHeaderCmd::Append.into()])
             .expect("can't fail");
 
         let args = AppendRequestHeader {
             size: EntrySize(u32::expect_from(raw_entry.len())),
         };
 
-        args.write(&mut cursor).expect("can't fail");
-        self.conn_write.write_all(&cmd_buf).await?;
+        // TODO: instead of copy, use `write_vectored_all` when it stabilizes
+        // https://github.com/rust-lang/rust/issues/70436
+        args.write(&mut NoSeek::new(&mut buf)).expect("can't fail");
+
+        buf.resize(REQUEST_HEADER_SIZE, 0);
+        buf.extend_from_slice(raw_entry);
 
         let mut entry_log_offset_buf = [0u8; AllocationId::BYTE_SIZE];
 
@@ -117,7 +121,7 @@ impl Client for RawClient {
                 // self.conn_read.read_u8().await?;
                 Ok(allocation_id)
             },
-            self.conn_write.write_all(raw_entry)
+            self.conn_write.write_all(&buf)
         )?;
 
         let offset = offset_res?;

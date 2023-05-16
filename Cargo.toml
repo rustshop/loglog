@@ -3,6 +3,7 @@ members = [
 	"api",
 	"loglogd-tokio-uring",
 	"loglog-tokio",
+	"loglog",
 	"loglogd",
 	"e2e-tests",
 ]
