@@ -203,7 +203,7 @@ impl RequestHandlerInner {
                 RequestHeaderCmd::Peer => {
                     todo!();
                 }
-                RequestHeaderCmd::Append => {
+                cmd @ (RequestHeaderCmd::Append | RequestHeaderCmd::AppendWait) => {
                     let args = match AppendRequestHeader::read(cursor) {
                         Ok(args) => args,
                         Err(e) => {
@@ -213,7 +213,13 @@ impl RequestHandlerInner {
                     };
                     debug!(cmd = ?cmd, args = ?args);
 
-                    self.handle_append_request(stream, buf, args.size).await?;
+                    self.handle_append_request(
+                        stream,
+                        buf,
+                        args.size,
+                        cmd == RequestHeaderCmd::AppendWait,
+                    )
+                    .await?;
                 }
                 RequestHeaderCmd::Fill => {
                     let args = match FillRequestHeader::read(cursor) {
@@ -263,6 +269,7 @@ impl RequestHandlerInner {
         stream: &mut TcpStream,
         buf: Vec<u8>,
         entry_size: EntrySize,
+        wait: bool,
     ) -> ConnectionResult<()> {
         let allocation_id = self.shared.allocate_new_entry(entry_size);
 
@@ -274,11 +281,37 @@ impl RequestHandlerInner {
             self.handle_fill_request(&mut read, buf, allocation_id, entry_size),
             async {
                 debug!("Sending response to append request");
-                let res_size = AllocationId::BYTE_SIZE;
+                let res_size = AllocationId::BYTE_SIZE + 1;
                 vec_extend_to_at_least(&mut resp_buf, res_size);
 
-                resp_buf[0..res_size].copy_from_slice(&allocation_id.to_bytes());
-                write.write_all(&resp_buf[..res_size]).await?;
+                resp_buf[0..AllocationId::BYTE_SIZE].copy_from_slice(&allocation_id.to_bytes());
+
+                if wait {
+                    write
+                        .write_all(&resp_buf[..AllocationId::BYTE_SIZE])
+                        .await?;
+                    let mut last_fsynced_log_offset_rx = self.last_fsynced_log_offset_rx.clone();
+
+                    loop {
+                        let last_fsynced_log_offset =
+                            *last_fsynced_log_offset_rx.borrow_and_update();
+
+                        if last_fsynced_log_offset < allocation_id.offset {
+                            if last_fsynced_log_offset_rx.changed().await.is_err() {
+                                return Ok(());
+                            }
+                        } else {
+                            resp_buf[AllocationId::BYTE_SIZE] = 0xff;
+                            write
+                                .write_all(&resp_buf[AllocationId::BYTE_SIZE..res_size])
+                                .await?;
+                            break;
+                        }
+                    }
+                } else {
+                    resp_buf[AllocationId::BYTE_SIZE] = 0xff;
+                    write.write_all(&resp_buf[..res_size]).await?;
+                }
                 Ok(())
             },
         );

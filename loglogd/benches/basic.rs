@@ -9,7 +9,11 @@ use loglog::Client;
 fn criterion_benchmark(c: &mut Criterion) {
     let server = TestLoglogd::new().unwrap();
 
-    let entries = [[1u8, 2u8, 3u8].as_slice(), [1u8; 10000].as_slice()];
+    let entries = [
+        [1u8, 2u8, 3u8].as_slice(),
+        [1u8; 10000].as_slice(),
+        [1u8; 100000].as_slice(),
+    ];
 
     let mut client = server.new_client().unwrap();
     {

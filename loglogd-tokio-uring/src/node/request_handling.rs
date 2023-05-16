@@ -168,6 +168,9 @@ impl RequestHandler {
                     self.handle_append_request(stream, entry_writer_tx, buf, args.size)
                         .await?;
                 }
+                RequestHeaderCmd::AppendWait => {
+                    unimplemented!();
+                }
                 RequestHeaderCmd::Fill => {
                     let args = match FillRequestHeader::read(cursor) {
                         Ok(args) => args,

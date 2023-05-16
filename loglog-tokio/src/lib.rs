@@ -106,72 +106,12 @@ impl Client for RawClient {
 
     /// Append an entry, without waiting for it to get commited in the log
     async fn append_nocommit(&mut self, raw_entry: &[u8]) -> Result<LogOffset> {
-        debug!(size = raw_entry.len(), "Appending new entry");
-
-        let mut buf = Vec::with_capacity(REQUEST_HEADER_SIZE + raw_entry.len());
-
-        std::io::Write::write_all(&mut buf, &[RequestHeaderCmd::Append.into()])
-            .expect("can't fail");
-
-        let args = AppendRequestHeader {
-            size: EntrySize(u32::expect_from(raw_entry.len())),
-        };
-
-        // TODO: instead of copy, use `write_vectored_all` when it stabilizes
-        // https://github.com/rust-lang/rust/issues/70436
-        args.write(&mut NoSeek::new(&mut buf)).expect("can't fail");
-
-        buf.resize(REQUEST_HEADER_SIZE, 0);
-        buf.extend_from_slice(raw_entry);
-
-        let mut entry_log_offset_buf = [0u8; AllocationId::BYTE_SIZE];
-
-        let (offset_res, _sent) = try_join!(
-            async {
-                self.conn_read.read_exact(&mut entry_log_offset_buf).await?;
-
-                let allocation_id = AllocationId::read(&mut Cursor::new(&entry_log_offset_buf));
-                // TODO: in the future here we will start sending the `raw_entry` to other peers
-                // right away using `Fill` call
-
-                // TODO: should we have any sort of "we're done here"?
-                // self.conn_read.read_u8().await?;
-                Ok(allocation_id)
-            },
-            self.conn_write.write_all(&buf)
-        )?;
-
-        let offset = offset_res?;
-
-        debug!(offset = %offset.offset, "New entry offset");
-        Ok(offset.offset)
+        self.append_inner(raw_entry, false).await
     }
 
     /// Append an entry and waiti for it to get commited in the log
     async fn append(&mut self, raw_entry: &[u8]) -> Result<LogOffset> {
-        let offset = self.append_nocommit(raw_entry).await?;
-        loop {
-            let read_start = Instant::now();
-            match self.append_read_commit(offset).await? {
-                ReadData::None => {
-                    let read_duration = read_start.elapsed();
-                    let min_read_duration = Duration::from_secs(1);
-                    if read_duration < min_read_duration {
-                        sleep(min_read_duration - read_duration).await;
-                    }
-                    continue;
-                }
-                ReadData::Invalid => {
-                    // we are actually not reading the whole entry, so we
-                    // are not checking if the written entry is valid. It
-                    // should be - if we returned any IO errors, we wouldn't be
-                    // here.
-                    unreachable!();
-                }
-                // 🤷 https://github.com/rust-lang/rust/issues/68117#issuecomment-573309675
-                ReadData::Some(offset) => return Ok(offset),
-            };
-        }
+        self.append_inner(raw_entry, true).await
     }
 }
 impl RawClient {
@@ -242,11 +182,58 @@ impl RawClient {
         Ok(ReadData::Some(&self.buf[payload_start_i..payload_end_i]))
     }
 
+    async fn append_inner(&mut self, raw_entry: &[u8], wait: bool) -> Result<LogOffset> {
+        debug!(size = raw_entry.len(), "Appending new entry");
+
+        let mut buf = Vec::with_capacity(REQUEST_HEADER_SIZE + raw_entry.len());
+
+        std::io::Write::write_all(
+            &mut buf,
+            &[if wait {
+                RequestHeaderCmd::AppendWait.into()
+            } else {
+                RequestHeaderCmd::Append.into()
+            }],
+        )
+        .expect("can't fail");
+
+        let args = AppendRequestHeader {
+            size: EntrySize(u32::expect_from(raw_entry.len())),
+        };
+
+        // TODO: instead of copy, use `write_vectored_all` when it stabilizes
+        // https://github.com/rust-lang/rust/issues/70436
+        args.write(&mut NoSeek::new(&mut buf)).expect("can't fail");
+
+        buf.resize(REQUEST_HEADER_SIZE, 0);
+        buf.extend_from_slice(raw_entry);
+
+        let mut entry_log_offset_buf = [0u8; AllocationId::BYTE_SIZE + 1];
+
+        let (offset_res, _sent) = try_join!(
+            async {
+                self.conn_read.read_exact(&mut entry_log_offset_buf).await?;
+
+                let allocation_id = AllocationId::read(&mut Cursor::new(&entry_log_offset_buf));
+                // TODO: in the future here we will start sending the `raw_entry` to other peers
+                // right away using `Fill` call
+
+                Ok(allocation_id)
+            },
+            self.conn_write.write_all(&buf)
+        )?;
+
+        let offset = offset_res?;
+
+        debug!(offset = %offset.offset, "New entry offset");
+        Ok(offset.offset)
+    }
+
     /// Wait for the server to commit to the written entry
     ///
     /// We use the offset returned for the allocated entry and
     /// just need to
-    async fn append_read_commit(&mut self, offset: LogOffset) -> Result<ReadData<LogOffset>> {
+    pub async fn wait_committed(&mut self, offset: LogOffset) -> Result<ReadData<LogOffset>> {
         let data_size =
             Self::inner_read(&mut self.conn_read, &mut self.conn_write, offset, 1, true).await?;
 

@@ -32,8 +32,10 @@ pub enum RequestHeaderCmd {
     Peer = 0,
     /// Append an entry to the log
     Append = 8,
+    /// Append an entry to the log
+    AppendWait = 9,
     /// Fill a previously allocated place in the log with data
-    Fill = 9,
+    Fill = 13,
     /// Read the log
     Read = 16,
     /// Read the log and wait if more not available
