@@ -142,6 +142,8 @@ impl RequestHandlerInner {
     }
 
     pub async fn handle_connection(&self, stream: &mut TcpStream) -> ConnectionResult<()> {
+        // We always prepare exact buffers to be sent immediately
+        stream.set_nodelay(true)?;
         self.handle_connection_init(stream).await?;
         self.handle_connection_loop(stream).await?;
         Ok(())

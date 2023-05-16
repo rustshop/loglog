@@ -120,6 +120,9 @@ impl RawClient {
         let stream = tokio::net::TcpStream::connect(server_addr).await?;
         trace!(?server_addr, "Connected");
 
+        // We always prepare exact buffers to be sent immediately
+        stream.set_nodelay(true)?;
+
         let (mut conn_read, mut conn_write) = tokio::io::split(stream);
 
         let mut buf = [0u8; ConnectionHello::BYTE_SIZE];
