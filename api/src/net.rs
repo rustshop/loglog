@@ -24,20 +24,22 @@ pub const REQUEST_HEADER_SIZE: usize = 14;
 /// Request header- command
 ///
 /// Every request starts with a one byte command
-#[derive(FromPrimitive, IntoPrimitive, Debug)]
+#[derive(FromPrimitive, IntoPrimitive, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 #[derive(BinRead)]
 #[br(repr = u8)]
 pub enum RequestHeaderCmd {
     Peer = 0,
     /// Append an entry to the log
-    Append = 1,
+    Append = 8,
     /// Fill a previously allocated place in the log with data
-    Fill = 2,
+    Fill = 9,
     /// Read the log
-    Read = 3,
+    Read = 16,
+    /// Read the log and wait if more not available
+    ReadWait = 17,
     /// Get the current log position
-    GetEnd = 4,
+    GetEnd = 32,
     #[default]
     Other,
 }

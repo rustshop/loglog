@@ -22,6 +22,8 @@ pub use loglogd_api::LogOffset;
 
 #[derive(Error, Debug)]
 pub enum Error {
+    #[error("empty response")]
+    Empty,
     #[error("io error: {0}")]
     Io(#[from] io::Error),
     #[error("data decoding error: {0}")]
@@ -41,6 +43,7 @@ pub trait Client {
     where
         Self: 'a;
     async fn read(&mut self) -> Result<Self::OutEntry<'_>>;
+    async fn read_nowait(&mut self) -> Result<Option<Self::OutEntry<'_>>>;
     async fn end_offset(&mut self) -> Result<LogOffset>;
     async fn append_nocommit(&mut self, raw_entry: Self::InEntry<'_>) -> Result<LogOffset>;
     async fn append(&mut self, raw_entry: Self::InEntry<'_>) -> Result<LogOffset>;
@@ -68,10 +71,24 @@ impl Client for RawClient {
 
     async fn read(&mut self) -> Result<&[u8]> {
         loop {
-            match self.next_raw_inner().await? {
+            match self.next_raw_inner(true).await? {
                 ReadData::None => {
-                    sleep(Duration::from_secs(1)).await;
+                    return Err(Error::Empty);
+                }
+                ReadData::Invalid => {
                     continue;
+                }
+                // 🤷 https://github.com/rust-lang/rust/issues/68117#issuecomment-573309675
+                ReadData::Some(d) => return unsafe { Ok(mem::transmute(d)) },
+            };
+        }
+    }
+
+    async fn read_nowait(&mut self) -> Result<Option<&[u8]>> {
+        loop {
+            match self.next_raw_inner(false).await? {
+                ReadData::None => {
+                    return Ok(None);
                 }
                 ReadData::Invalid => {
                     continue;
@@ -189,12 +206,12 @@ impl RawClient {
     }
 
     /// Return next raw entry
-    async fn next_raw_inner(&mut self) -> Result<ReadData<&'_ [u8]>> {
+    async fn next_raw_inner(&mut self, wait: bool) -> Result<ReadData<&'_ [u8]>> {
         debug_assert!(self.next_event_i <= self.buf.len());
 
         self.maybe_compact_buf();
 
-        if self.fetch_header().await?.is_none() {
+        if self.fetch_header(wait).await?.is_none() {
             return Ok(ReadData::None);
         }
 
@@ -209,7 +226,7 @@ impl RawClient {
                 + EntryHeader::BYTE_SIZE
                 + EntryTrailer::BYTE_SIZE
         {
-            if self.fetch_more_data().await?.is_none() {
+            if self.fetch_more_data(wait).await?.is_none() {
                 return Ok(ReadData::None);
             }
         }
@@ -231,7 +248,7 @@ impl RawClient {
     /// just need to
     async fn append_read_commit(&mut self, offset: LogOffset) -> Result<ReadData<LogOffset>> {
         let data_size =
-            Self::inner_read(&mut self.conn_read, &mut self.conn_write, offset, 1).await?;
+            Self::inner_read(&mut self.conn_read, &mut self.conn_write, offset, 1, true).await?;
 
         if data_size == 0 {
             return Ok(ReadData::None);
@@ -243,9 +260,9 @@ impl RawClient {
         Ok(ReadData::Some(offset))
     }
 
-    async fn fetch_header(&mut self) -> Result<Option<()>> {
+    async fn fetch_header(&mut self, wait: bool) -> Result<Option<()>> {
         while !self.has_header() {
-            match self.fetch_more_data().await? {
+            match self.fetch_more_data(wait).await? {
                 Some(_) => {}
                 None => return Ok(None),
             }
@@ -284,13 +301,21 @@ impl RawClient {
         mut write: impl AsyncWriteExt + Unpin,
         log_offset: LogOffset,
         limit: u32,
+        wait: bool,
     ) -> Result<u32> {
         let mut cmd_buf = [0u8; REQUEST_HEADER_SIZE];
 
         let mut cursor = Cursor::new(&mut cmd_buf[0..]);
 
-        std::io::Write::write_all(&mut cursor, &[RequestHeaderCmd::Read.into()])
-            .expect("can't fail");
+        std::io::Write::write_all(
+            &mut cursor,
+            &[if wait {
+                RequestHeaderCmd::ReadWait.into()
+            } else {
+                RequestHeaderCmd::Read.into()
+            }],
+        )
+        .expect("can't fail");
 
         let args = ReadRequestHeader {
             offset: log_offset,
@@ -314,12 +339,13 @@ impl RawClient {
     /// Err - there was an error
     /// Ok(None) - no more data available
     /// OK(Some(size)) - new data loaded
-    async fn fetch_more_data(&mut self) -> Result<Option<usize>> {
+    async fn fetch_more_data(&mut self, wait: bool) -> Result<Option<usize>> {
         let data_size = Self::inner_read(
             &mut self.conn_read,
             &mut self.conn_write,
             self.log_offset,
             1024 * 64,
+            wait,
         )
         .await?;
 

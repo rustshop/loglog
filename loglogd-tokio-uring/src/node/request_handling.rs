@@ -187,7 +187,7 @@ impl RequestHandler {
                     )
                     .await?;
                 }
-                RequestHeaderCmd::Read => {
+                cmd @ (RequestHeaderCmd::Read | RequestHeaderCmd::ReadWait) => {
                     let args = match ReadRequestHeader::read(cursor) {
                         Ok(args) => args,
                         Err(e) => {
@@ -197,8 +197,13 @@ impl RequestHandler {
                     };
                     debug!(cmd = ?cmd, args = ?args);
 
-                    self.handle_read_request(stream, args.offset, args.limit)
-                        .await?;
+                    self.handle_read_request(
+                        stream,
+                        args.offset,
+                        args.limit,
+                        cmd == RequestHeaderCmd::ReadWait,
+                    )
+                    .await?;
                 }
                 RequestHeaderCmd::GetEnd => {
                     debug!(cmd = ?cmd);
@@ -494,11 +499,10 @@ impl RequestHandler {
         stream: &mut TcpStream,
         mut log_offset: LogOffset,
         limit: ReadDataSize,
+        wait: bool,
     ) -> ConnectionResult<()> {
         // TODO: change this to `commited_log_offset` when Raft is implemented
         let mut last_fsynced_log_offset_rx = self.last_fsynced_log_offset_rx.clone();
-
-        let mut retry = 0;
 
         let mut num_bytes_to_send = loop {
             let last_fsynced_log_offset = *last_fsynced_log_offset_rx.borrow_and_update();
@@ -522,13 +526,12 @@ impl RequestHandler {
             );
 
             if num_bytes_to_send == 0 {
-                retry += 1;
-
-                if 10 < retry {
+                if !wait {
                     break num_bytes_to_send;
                 }
-                // ignore errors
-                let _ = last_fsynced_log_offset_rx.changed().await;
+                if last_fsynced_log_offset_rx.changed().await.is_err() {
+                    break num_bytes_to_send;
+                }
             } else {
                 break num_bytes_to_send;
             }
