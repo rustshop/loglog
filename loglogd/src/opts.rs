@@ -11,7 +11,7 @@ pub struct Opts {
     #[clap(long = "listen", default_value = "127.0.0.1:8080")]
     pub listen: SocketAddr,
 
-    #[clap(long = "segment-size", parse(try_from_str = parse_byte_unit))]
+    #[clap(long = "segment-size", value_parser = parse_byte_unit)]
     pub base_segment_file_size: Option<u64>,
 }
 

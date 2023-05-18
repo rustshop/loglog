@@ -20,7 +20,7 @@ path = "src/lib.rs"
 async-trait = "*"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing = "0.1.35"
-clap = { version = "3.1.6", features = [ "derive", "env" ] }
+clap = { version = "4.2.7", features = [ "derive", "env" ] }
 error-stack = "0.1.1"
 tokio = { version = "1.19.2", features = ["macros", "rt", "rt-multi-thread", "signal", "io-util", "net", "sync"] }
 thiserror = "1.0.31"

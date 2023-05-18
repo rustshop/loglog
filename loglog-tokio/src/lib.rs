@@ -9,12 +9,10 @@ use loglogd_api::{
 };
 use std::io::Cursor;
 use std::mem;
-use std::time::{Duration, Instant};
 use std::{io, net::SocketAddr};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::io::{ReadHalf, WriteHalf};
-use tokio::time::sleep;
 use tokio::try_join;
 use tracing::{debug, trace};
 
