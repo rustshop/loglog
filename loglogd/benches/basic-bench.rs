@@ -10,9 +10,9 @@ fn criterion_benchmark(c: &mut Criterion) {
     let server = TestLoglogd::new().unwrap();
 
     let entries = [
-        [1u8, 2u8, 3u8].as_slice(),
-        [1u8; 10000].as_slice(),
-        [1u8; 100000].as_slice(),
+        [1u8].as_slice(),
+        [2u8; 1000].as_slice(),
+        [3u8; 100000].as_slice(),
     ];
 
     let mut client = server.new_client().unwrap();
@@ -41,6 +41,8 @@ fn criterion_benchmark(c: &mut Criterion) {
         write_commit.finish();
     }
     {
+        // new client to ignore the previous entries
+        let mut client = server.new_client().unwrap();
         let mut roundtrip = c.benchmark_group("roundtrip");
         for entry in entries {
             roundtrip.throughput(criterion::Throughput::Bytes(u64::expect_from(entry.len())));
@@ -50,7 +52,8 @@ fn criterion_benchmark(c: &mut Criterion) {
                 |b, entry| {
                     b.iter(|| {
                         client.append_nocommit(entry).unwrap();
-                        client.read().unwrap();
+                        let read = client.read().unwrap();
+                        assert_eq!(entry.len(), read.len());
                     })
                 },
             );
