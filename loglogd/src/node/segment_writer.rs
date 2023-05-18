@@ -16,7 +16,7 @@ use super::NodeShared;
 
 pub struct SegmentWriter {
     #[allow(unused)]
-    join_handle: AutoJoinHandle,
+    join_handles: Vec<AutoJoinHandle>,
 }
 
 impl SegmentWriter {
@@ -28,31 +28,39 @@ impl SegmentWriter {
         let inner = Arc::new(WriteLoopInner {
             shared,
             rx: new_entry_rx,
-            last_written_entry_log_offset_tx: last_written_entry_log_offset_tx.clone(),
+            last_written_entry_log_offset_tx,
         });
 
         Self {
-            join_handle: AutoJoinHandle::spawn({
-                move || {
-                    let _guard = scopeguard::guard((), {
-                        |_| {
-                            info!("SegmentWriter is done");
-                            inner
-                                .shared
-                                .is_segment_writer_done
-                                .store(true, Ordering::SeqCst);
-                            // final update, just to make sure the `SegmentSealer` finishes
-                            last_written_entry_log_offset_tx.update(|_v| {})
-                        }
-                    });
+            join_handles: (0..16)
+                .map(|_| {
+                    AutoJoinHandle::spawn({
+                        let inner = inner.clone();
+                        move || {
+                            let _guard = scopeguard::guard((), {
+                                |_| {
+                                    info!("SegmentWriter is done");
+                                    inner
+                                        .shared
+                                        .is_segment_writer_done
+                                        .store(true, Ordering::SeqCst);
+                                    // final update, just to make sure the `SegmentSealer` finishes
+                                    inner.last_written_entry_log_offset_tx.update(|_v| {})
+                                }
+                            });
 
-                    while let Ok(entry) = inner.rx.recv() {
-                        inner
-                            .handle_entry_write(entry, &inner.last_written_entry_log_offset_tx)
-                            .expect("Error while writting entry to segment file");
-                    }
-                }
-            }),
+                            while let Ok(entry) = inner.rx.recv() {
+                                inner
+                                    .handle_entry_write(
+                                        entry,
+                                        &inner.last_written_entry_log_offset_tx,
+                                    )
+                                    .expect("Error while writting entry to segment file");
+                            }
+                        }
+                    })
+                })
+                .collect(),
         }
     }
 }
