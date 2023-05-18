@@ -57,6 +57,8 @@ fn criterion_benchmark(c: &mut Criterion) {
         }
         roundtrip.finish();
     }
+
+    drop(client);
 }
 
 criterion_group!(benches, criterion_benchmark);

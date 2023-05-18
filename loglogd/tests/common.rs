@@ -8,7 +8,7 @@ use std::{net::SocketAddr, str::FromStr};
 pub struct TestLoglogd {
     #[allow(unused)]
     data_dir: tempfile::TempDir,
-    node: loglogd::Node,
+    node: Option<loglogd::Node>,
 }
 
 impl TestLoglogd {
@@ -18,12 +18,16 @@ impl TestLoglogd {
         let node = loglogd::Node::new(SocketAddr::from_str("[::]:0")?, params.build())?;
         Ok(Self {
             data_dir: dir,
-            node,
+            node: Some(node),
         })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
-        self.node.get_ctrl().local_addr()
+        self.node().get_ctrl().local_addr()
+    }
+
+    pub fn node(&self) -> &loglogd::Node {
+        self.node.as_ref().expect("Node was already dropped")
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -41,6 +45,7 @@ impl TestLoglogd {
 
 impl Drop for TestLoglogd {
     fn drop(&mut self) {
-        self.node.get_ctrl().stop()
+        self.node().get_ctrl().stop();
+        self.node.take(); // drop before tmp directory is cleaned
     }
 }
