@@ -33,13 +33,13 @@ impl SegmentWriter {
 
         Self {
             join_handles: (0..16)
-                .map(|_| {
+                .map(|i| {
                     AutoJoinHandle::spawn({
                         let inner = inner.clone();
                         move || {
                             let _guard = scopeguard::guard((), {
                                 |_| {
-                                    info!("SegmentWriter is done");
+                                    info!("SegmentWriter[{i}] is done");
                                     inner
                                         .shared
                                         .is_segment_writer_done

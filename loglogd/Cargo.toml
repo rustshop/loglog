@@ -42,7 +42,7 @@ atty = "*"
 futures = "*"
 signal-hook = "0.3.15"
 scopeguard = "1.1.0"
-watch = "0.2.2"
+watch = { version = "0.2.2", features = ["parking_lot"] }
 
 [dev-dependencies]
 tempfile = "3.4.0"
