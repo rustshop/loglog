@@ -298,7 +298,7 @@ impl RequestHandlerInner {
                         let last_fsynced_log_offset =
                             *last_fsynced_log_offset_rx.borrow_and_update();
 
-                        if last_fsynced_log_offset < allocation_id.offset {
+                        if last_fsynced_log_offset <= allocation_id.offset {
                             if last_fsynced_log_offset_rx.changed().await.is_err() {
                                 return Ok(());
                             }
