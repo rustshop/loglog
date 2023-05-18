@@ -7,3 +7,6 @@ members = [
 	"loglogd",
 	"e2e-tests",
 ]
+
+[patch.crates-io]
+watch = { git = "https://github.com/dpc/watch", branch="wait_timeout" }

@@ -1,6 +1,7 @@
 use std::{
     os::fd::AsRawFd,
     sync::{atomic::Ordering, Arc},
+    time::Duration,
 };
 
 use crate::{
@@ -30,7 +31,8 @@ impl SegmentSealer {
                 });
                 loop {
                     // we actually don't use the value, and blocking for updates
-                    let _last_written_entry_log_offset = last_written_entry_log_offset_rx.wait();
+                    let _last_written_entry_log_offset =
+                        last_written_entry_log_offset_rx.wait_timeout(Duration::from_secs(1));
 
                     let first_unwritten_log_offset = shared.get_first_unwritten_log_offset();
                     let fsynced_log_offset = shared.fsynced_log_offset.load(Ordering::SeqCst);

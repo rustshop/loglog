@@ -1553,8 +1553,7 @@ checksum = "ed9d5b4305409d1fc9482fee2d7f9bcbf24b3972bf59817ef757e23982242a93"
 [[package]]
 name = "watch"
 version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40b2a1d95f504bd0d3b08b211f9e626a0ae6537c838a9de0a1696e359242d339"
+source = "git+https://github.com/dpc/watch?branch=wait_timeout#c8fdf628ad130e3c4bf6bc7a0413656c229b0f70"
 
 [[package]]
 name = "web-sys"
