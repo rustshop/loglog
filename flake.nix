@@ -90,6 +90,9 @@
                 pkgs.cargo
                 pkgs.clippy
 
+                # Bench
+                pkgs.gnuplot
+
                 # Lints
                 pkgs.rustfmt
                 pkgs.rnix-lsp
