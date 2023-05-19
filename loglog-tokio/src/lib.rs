@@ -12,7 +12,6 @@ use std::mem;
 use std::{io, net::SocketAddr};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::io::{ReadHalf, WriteHalf};
 use tokio::try_join;
 use tracing::{debug, trace};
 
@@ -52,8 +51,7 @@ pub struct RawClient {
     log_offset: LogOffset,
     buf: Vec<u8>,
     next_event_i: usize,
-    conn_read: ReadHalf<tokio::net::TcpStream>,
-    conn_write: WriteHalf<tokio::net::TcpStream>,
+    conn: tokio::net::TcpStream,
 }
 
 pub enum ReadData<T> {
@@ -99,7 +97,7 @@ impl Client for RawClient {
 
     /// The [`LogOffset`] of end of the stream (right after last commited entry)
     async fn end_offset(&mut self) -> Result<LogOffset> {
-        Self::inner_get_end(&mut self.conn_read, &mut self.conn_write).await
+        Self::inner_get_end(&mut self.conn).await
     }
 
     /// Append an entry, without waiting for it to get commited in the log
@@ -115,16 +113,14 @@ impl Client for RawClient {
 impl RawClient {
     pub async fn connect(server_addr: SocketAddr, log_offset: Option<LogOffset>) -> Result<Self> {
         debug!(?server_addr, "Connecting to loglogd");
-        let stream = tokio::net::TcpStream::connect(server_addr).await?;
+        let mut conn = tokio::net::TcpStream::connect(server_addr).await?;
         trace!(?server_addr, "Connected");
 
         // We always prepare exact buffers to be sent immediately
-        stream.set_nodelay(true)?;
-
-        let (mut conn_read, mut conn_write) = tokio::io::split(stream);
+        conn.set_nodelay(true)?;
 
         let mut buf = [0u8; ConnectionHello::BYTE_SIZE];
-        conn_read.read_exact(&mut buf).await?;
+        conn.read_exact(&mut buf).await?;
         let hello = ConnectionHello::read(&mut Cursor::new(&mut buf))?;
 
         if hello.version != LOGLOGD_VERSION_0 {
@@ -134,15 +130,14 @@ impl RawClient {
         let log_offset = if let Some(off) = log_offset {
             off
         } else {
-            Self::inner_get_end(&mut conn_read, &mut conn_write).await?
+            Self::inner_get_end(&mut conn).await?
         };
 
         Ok(Self {
             buf: vec![],
             log_offset,
             next_event_i: 0,
-            conn_read,
-            conn_write,
+            conn,
         })
     }
 
@@ -211,9 +206,10 @@ impl RawClient {
 
         let mut entry_log_offset_buf = [0u8; AllocationId::BYTE_SIZE + 1];
 
+        let (mut conn_read, mut conn_write) = tokio::io::split(&mut self.conn);
         let (offset_res, _sent) = try_join!(
             async {
-                self.conn_read.read_exact(&mut entry_log_offset_buf).await?;
+                conn_read.read_exact(&mut entry_log_offset_buf).await?;
 
                 let allocation_id = AllocationId::read(&mut Cursor::new(&entry_log_offset_buf));
                 // TODO: in the future here we will start sending the `raw_entry` to other peers
@@ -221,7 +217,7 @@ impl RawClient {
 
                 Ok(allocation_id)
             },
-            self.conn_write.write_all(&buf)
+            conn_write.write_all(&buf)
         )?;
 
         let offset = offset_res?;
@@ -235,15 +231,14 @@ impl RawClient {
     /// We use the offset returned for the allocated entry and
     /// just need to
     pub async fn wait_committed(&mut self, offset: LogOffset) -> Result<ReadData<LogOffset>> {
-        let data_size =
-            Self::inner_read(&mut self.conn_read, &mut self.conn_write, offset, 1, true).await?;
+        let data_size = Self::inner_read(&mut self.conn, offset, 1, true).await?;
 
         if data_size == 0 {
             return Ok(ReadData::None);
         }
         debug_assert_eq!(data_size, 1);
         // read that one byte out
-        self.conn_read.read_u8().await?;
+        self.conn.read_u8().await?;
 
         Ok(ReadData::Some(offset))
     }
@@ -258,10 +253,7 @@ impl RawClient {
         Ok(Some(()))
     }
 
-    async fn inner_get_end(
-        mut read: impl AsyncReadExt + Unpin,
-        mut write: impl AsyncWriteExt + Unpin,
-    ) -> Result<LogOffset> {
+    async fn inner_get_end(conn: &mut tokio::net::TcpStream) -> Result<LogOffset> {
         let mut cmd_buf = [0u8; REQUEST_HEADER_SIZE];
 
         let mut cursor = Cursor::new(&mut cmd_buf[0..]);
@@ -269,11 +261,11 @@ impl RawClient {
         std::io::Write::write_all(&mut cursor, &[RequestHeaderCmd::GetEnd.into()])
             .expect("can't fail");
 
-        write.write_all(&cmd_buf).await?;
+        conn.write_all(&cmd_buf).await?;
 
         let mut data_size_buf = [0u8; GetEndResponse::BYTE_SIZE];
 
-        read.read_exact(&mut data_size_buf).await?;
+        conn.read_exact(&mut data_size_buf).await?;
 
         let response = GetEndResponse::read(&mut Cursor::new(data_size_buf.as_slice()))?;
 
@@ -285,8 +277,7 @@ impl RawClient {
     /// Returns number of bytes the server is going to send
     /// over through the `read`
     async fn inner_read(
-        mut read: impl AsyncReadExt + Unpin,
-        mut write: impl AsyncWriteExt + Unpin,
+        conn: &mut tokio::net::TcpStream,
         log_offset: LogOffset,
         limit: u32,
         wait: bool,
@@ -311,11 +302,11 @@ impl RawClient {
         };
 
         args.write(&mut cursor).expect("can't fail");
-        write.write_all(&cmd_buf).await?;
+        conn.write_all(&cmd_buf).await?;
 
         let mut data_size_buf = [0u8; ReadDataSize::BYTE_SIZE];
 
-        read.read_exact(&mut data_size_buf).await?;
+        conn.read_exact(&mut data_size_buf).await?;
 
         let data_size = ReadDataSize::read(&mut Cursor::new(data_size_buf.as_slice()))?.0;
 
@@ -328,14 +319,7 @@ impl RawClient {
     /// Ok(None) - no more data available
     /// OK(Some(size)) - new data loaded
     async fn fetch_more_data(&mut self, wait: bool) -> Result<Option<usize>> {
-        let data_size = Self::inner_read(
-            &mut self.conn_read,
-            &mut self.conn_write,
-            self.log_offset,
-            1024 * 64,
-            wait,
-        )
-        .await?;
+        let data_size = Self::inner_read(&mut self.conn, self.log_offset, 1024 * 64, wait).await?;
 
         if data_size == 0 {
             assert!(!wait);
@@ -347,11 +331,7 @@ impl RawClient {
         let prev_len = self.buf.len();
         let new_len = prev_len + usize::cast_from(data_size);
         self.buf.resize(new_len, 0);
-        match self
-            .conn_read
-            .read_exact(&mut self.buf[prev_len..new_len])
-            .await
-        {
+        match self.conn.read_exact(&mut self.buf[prev_len..new_len]).await {
             Ok(read) => {
                 debug_assert_eq!(read, usize::cast_from(data_size));
                 self.log_offset.0 += u64::from(data_size);
