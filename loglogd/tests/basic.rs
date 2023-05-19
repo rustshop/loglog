@@ -1,9 +1,9 @@
 mod common;
 
+use loglog::std::Client;
 use std::thread;
 
 use common::*;
-use loglog::Client;
 
 // fn init_logging() {
 // use std::io;

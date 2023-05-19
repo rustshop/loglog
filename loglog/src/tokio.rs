@@ -9,32 +9,17 @@ use loglogd_api::{
 };
 use std::io::Cursor;
 use std::mem;
-use std::{io, net::SocketAddr};
-use thiserror::Error;
+use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::try_join;
 use tracing::{debug, trace};
 
+use super::{Error, ReadData, Result};
+
 pub use loglogd_api::LogOffset;
 
-#[derive(Error, Debug)]
-pub enum Error {
-    #[error("empty response")]
-    Empty,
-    #[error("io error: {0}")]
-    Io(#[from] io::Error),
-    #[error("data decoding error: {0}")]
-    Decoding(#[from] binrw::Error),
-    #[error("invalid protocol version: {0}")]
-    ProtocolVersion(u8),
-    #[error("data corrupted")]
-    Corrupted,
-}
-
-pub type Result<T> = std::result::Result<T, Error>;
-
 #[async_trait]
-pub trait Client {
+pub trait AsyncClient {
     type InEntry<'a>;
     type OutEntry<'a>
     where
@@ -54,14 +39,8 @@ pub struct RawClient {
     conn: tokio::net::TcpStream,
 }
 
-pub enum ReadData<T> {
-    None,
-    Invalid,
-    Some(T),
-}
-
 #[async_trait]
-impl Client for RawClient {
+impl AsyncClient for RawClient {
     type InEntry<'a> = &'a [u8];
     type OutEntry<'a> = &'a [u8];
 
@@ -110,6 +89,7 @@ impl Client for RawClient {
         self.append_inner(raw_entry, true).await
     }
 }
+
 impl RawClient {
     pub async fn connect(server_addr: SocketAddr, log_offset: Option<LogOffset>) -> Result<Self> {
         debug!(?server_addr, "Connecting to loglogd");
@@ -227,9 +207,6 @@ impl RawClient {
     }
 
     /// Wait for the server to commit to the written entry
-    ///
-    /// We use the offset returned for the allocated entry and
-    /// just need to
     pub async fn wait_committed(&mut self, offset: LogOffset) -> Result<ReadData<LogOffset>> {
         let data_size = Self::inner_read(&mut self.conn, offset, 1, true).await?;
 

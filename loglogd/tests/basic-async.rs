@@ -1,7 +1,7 @@
 mod common;
 
 use common::*;
-use loglog_tokio::Client;
+use loglog::tokio::AsyncClient;
 use tokio::test;
 
 // fn init_logging() {

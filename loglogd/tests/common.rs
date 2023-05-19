@@ -34,12 +34,12 @@ impl TestLoglogd {
         self.data_dir.path()
     }
 
-    pub async fn new_client_async(&self) -> Result<loglog_tokio::RawClient> {
-        Ok(loglog_tokio::RawClient::connect(self.local_addr(), None).await?)
+    pub async fn new_client_async(&self) -> Result<loglog::tokio::RawClient> {
+        Ok(loglog::tokio::RawClient::connect(self.local_addr(), None).await?)
     }
 
-    pub fn new_client(&self) -> Result<loglog::RawClient> {
-        Ok(loglog::RawClient::connect(self.local_addr(), None)?)
+    pub fn new_client(&self) -> Result<loglog::std::RawClient> {
+        Ok(loglog::std::RawClient::connect(self.local_addr(), None)?)
     }
 }
 

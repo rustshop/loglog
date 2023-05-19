@@ -46,7 +46,6 @@ watch = { version = "0.2.2", features = ["parking_lot"] }
 
 [dev-dependencies]
 tempfile = "3.4.0"
-loglog-tokio = { path = "../loglog-tokio/" }
 loglog= { path = "../loglog/" }
 criterion = { version = "0.4", features = ["html_reports"] }
 

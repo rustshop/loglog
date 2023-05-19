@@ -2,7 +2,7 @@ use std::io;
 
 use derive_more::Display;
 use error_stack::{Context, IntoReport, ResultExt};
-use loglog_tokio::{Client, LogOffset, RawClient};
+use loglog::tokio::{AsyncClient, LogOffset, RawClient};
 use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, Display)]

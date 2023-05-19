@@ -4,7 +4,7 @@ mod common;
 use common::TestLoglogd;
 use convi::ExpectFrom;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use loglog::Client;
+use loglog::std::Client;
 
 fn criterion_benchmark(c: &mut Criterion) {
     let server = TestLoglogd::new().unwrap();

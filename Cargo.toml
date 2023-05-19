@@ -1,7 +1,6 @@
 [workspace]
 members = [
 	"api",
-	"loglog-tokio",
 	"loglog",
 	"loglogd",
 	"e2e-tests",

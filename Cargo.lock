@@ -162,6 +162,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "17febce684fd15d89027105661fec94afb475cb995fbc59d2865198446ba2eea"
 
 [[package]]
+name = "byteorder"
+version = "1.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14c189c53d098945499cdfa7ecc63567cf3886b3332b312a5b4585d8d3a6a610"
+
+[[package]]
 name = "bytes"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -286,12 +292,6 @@ name = "convert_case"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6245d59a3e82a7fc217c5828a6692dbc6dfb63a0c8c90495621f7b9d79704a0e"
-
-[[package]]
-name = "convi"
-version = "0.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83058f8e26f29f8f1bca9e857a07062e1cc0e458e6fedd4efa7c9e903d51f27e"
 
 [[package]]
 name = "convi"
@@ -700,36 +700,21 @@ dependencies = [
 name = "loglog"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "binrw 0.11.2",
  "clap 4.2.7",
- "convi 0.0.7",
+ "convi",
  "error-stack",
  "loglogd-api",
  "nix 0.26.2",
  "num_enum 0.6.1",
- "thiserror",
- "tracing",
- "tracing-subscriber",
- "typed-builder 0.14.0",
-]
-
-[[package]]
-name = "loglog-tokio"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "binrw 0.11.2",
- "clap 4.2.7",
- "convi 0.0.5",
- "error-stack",
- "loglogd-api",
- "nix 0.24.3",
- "num_enum 0.5.11",
+ "rmp-serde",
+ "serde",
  "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "typed-builder 0.10.0",
+ "typed-builder 0.14.0",
 ]
 
 [[package]]
@@ -740,14 +725,13 @@ dependencies = [
  "atty",
  "binrw 0.11.2",
  "clap 4.2.7",
- "convi 0.0.7",
+ "convi",
  "criterion",
  "derive_more",
  "error-stack",
  "flume",
  "futures",
  "loglog",
- "loglog-tokio",
  "loglogd-api",
  "nix 0.26.2",
  "num_enum 0.6.1",
@@ -779,10 +763,10 @@ dependencies = [
  "atty",
  "binrw 0.9.2",
  "clap 4.2.7",
- "convi 0.0.7",
+ "convi",
  "derive_more",
  "error-stack",
- "loglog-tokio",
+ "loglog",
  "nix 0.24.3",
  "num_enum 0.5.11",
  "rand",
@@ -1008,6 +992,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "paste"
+version = "1.0.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f746c4065a8fa3fe23974dd82f15431cc8d40779821001404d10d2e79ca7d79"
+
+[[package]]
 name = "pin-project"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1200,6 +1190,28 @@ name = "regex-syntax"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a5996294f19bd3aae0453a862ad728f60e6600695733dd5df01da90c54363a3c"
+
+[[package]]
+name = "rmp"
+version = "0.8.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44519172358fd6d58656c86ab8e7fbc9e1490c3e8f14d35ed78ca0dd07403c9f"
+dependencies = [
+ "byteorder",
+ "num-traits",
+ "paste",
+]
+
+[[package]]
+name = "rmp-serde"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5b13be192e0220b8afb7222aa5813cb62cc269ebb5cac346ca6487681d2913e"
+dependencies = [
+ "byteorder",
+ "rmp",
+ "serde",
+]
 
 [[package]]
 name = "rustc_version"

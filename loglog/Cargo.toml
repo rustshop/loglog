@@ -16,6 +16,11 @@ readme = "../README.md"
 name = "loglog"
 path = "src/lib.rs"
 
+[features]
+tokio = ["dep:tokio", "dep:async-trait"]
+rmp = ["dep:rmp-serde", "dep:serde"]
+default = [ "rmp" ]
+
 [dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing = "0.1.35"
@@ -28,3 +33,8 @@ binrw = "0.11.1"
 typed-builder = "0.14.0"
 loglogd-api = { path = "../api/" }
 convi = { version = "0.0.7", features = [ "min_target_pointer_width_32" ] }
+rmp-serde = { version = "*", optional = true }
+serde = { version = "*", optional = true }
+
+async-trait = { version = "*", optional = true}
+tokio = { version = "1.19.2", features = ["macros", "rt", "rt-multi-thread", "signal", "io-util", "net", "sync"] , optional = true}
