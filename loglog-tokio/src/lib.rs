@@ -338,6 +338,7 @@ impl RawClient {
         .await?;
 
         if data_size == 0 {
+            assert!(!wait);
             return Ok(None);
         }
 

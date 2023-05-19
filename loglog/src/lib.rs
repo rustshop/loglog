@@ -319,6 +319,7 @@ impl RawClient {
         let data_size = Self::inner_read(&mut self.conn, self.log_offset, 1024 * 64, wait)?;
 
         if data_size == 0 {
+            assert!(!wait);
             return Ok(None);
         }
 
