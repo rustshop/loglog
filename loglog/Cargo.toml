@@ -1,0 +1,30 @@
+[package]
+name = "loglog"
+version = "0.1.0"
+edition = "2021"
+authors = ["Dawid Ciężarkiewicz <dpc@dpc.pw>"]
+description = "Client library for LogLog"
+documentation = "https://github.com/rustshop/loglog"
+homepage = "https://github.com/rustshop/loglog"
+repository = "https://github.com/rustshop/loglog"
+keywords = ["distributed", "cloud"]
+license = "MPL-2.0"
+readme = "../README.md"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "loglog"
+path = "src/lib.rs"
+
+[dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = "0.1.35"
+clap = { version = "4.2.7", features = [ "derive", "env" ] }
+error-stack = "0.1.1"
+thiserror = "1.0.31"
+num_enum = "0.6.1"
+nix = "0.26.2"
+binrw = "0.11.1"
+typed-builder = "0.14.0"
+loglogd-api = { path = "../api/" }
+convi = { version = "0.0.7", features = [ "min_target_pointer_width_32" ] }
