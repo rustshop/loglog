@@ -289,12 +289,6 @@ checksum = "6245d59a3e82a7fc217c5828a6692dbc6dfb63a0c8c90495621f7b9d79704a0e"
 
 [[package]]
 name = "convi"
-version = "0.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0065a247829db5fa783ee4c5a1b52f77db4c12fd4edb355c485d2d5040eeb36e"
-
-[[package]]
-name = "convi"
 version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "83058f8e26f29f8f1bca9e857a07062e1cc0e458e6fedd4efa7c9e903d51f27e"
@@ -630,16 +624,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "io-uring"
-version = "0.5.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd1e1a01cfb924fd8c5c43b6827965db394f5a3a16c599ce03452266e1cf984c"
-dependencies = [
- "bitflags",
- "libc",
-]
-
-[[package]]
 name = "is-terminal"
 version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -799,36 +783,12 @@ dependencies = [
  "derive_more",
  "error-stack",
  "loglog-tokio",
- "loglogd-tokio-uring",
  "nix 0.24.3",
  "num_enum 0.5.11",
  "rand",
  "tempfile",
  "thiserror",
  "tokio",
- "tracing",
- "tracing-subscriber",
- "typed-builder 0.10.0",
-]
-
-[[package]]
-name = "loglogd-tokio-uring"
-version = "0.1.0"
-dependencies = [
- "atty",
- "binrw 0.11.2",
- "clap 4.2.7",
- "convi 0.0.4",
- "derive_more",
- "error-stack",
- "futures",
- "loglogd-api",
- "nix 0.24.3",
- "num_enum 0.5.11",
- "scopeguard",
- "thiserror",
- "tokio",
- "tokio-uring",
  "tracing",
  "tracing-subscriber",
  "typed-builder 0.10.0",
@@ -1289,12 +1249,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "scoped-tls"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
-
-[[package]]
 name = "scopeguard"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1534,20 +1488,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.16",
-]
-
-[[package]]
-name = "tokio-uring"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d5e02bb137e030b3a547c65a3bd2f1836d66a97369fdcc69034002b10e155ef"
-dependencies = [
- "io-uring",
- "libc",
- "scoped-tls",
- "slab",
- "socket2",
- "tokio",
 ]
 
 [[package]]

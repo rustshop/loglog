@@ -37,6 +37,5 @@ derive_more = "*"
 rand = "*"
 
 [dev-dependencies]
-loglogd-tokio-uring = { path = "../loglogd-tokio-uring" }
 tempfile = "3.4.0"
 anyhow = "*"
