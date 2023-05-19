@@ -1,6 +1,5 @@
 #![deny(clippy::as_conversions)]
 
-mod ioutil;
 mod opts;
 
 use loglogd::Parameters;
