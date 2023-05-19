@@ -32,7 +32,7 @@ impl SegmentWriter {
         });
 
         Self {
-            join_handles: (0..16)
+            join_handles: (0..8)
                 .map(|i| {
                     AutoJoinHandle::spawn({
                         let inner = inner.clone();
