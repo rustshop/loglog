@@ -223,19 +223,6 @@ impl RequestHandlerInner {
                 )
                 .await?;
             }
-            // RequestHeaderCmd::Fill => {
-            //     let args = match FillRequestHeader::read(cursor) {
-            //         Ok(args) => args,
-            //         Err(e) => {
-            //             self.shared.put_entry_buffer(buf);
-            //             return Err(e.into());
-            //         }
-            //     };
-            //     debug!(cmd = ?cmd, args = ?args);
-
-            //     self.handle_fill_request(stream, buf, args.allocation_id, args.size)
-            //         .await?;
-            // }
             cmd @ (RequestHeaderCmd::Read | RequestHeaderCmd::ReadWait) => {
                 let args = ReadRequestHeader::read(cursor)?;
                 debug!(cmd = ?cmd, args = ?args);
