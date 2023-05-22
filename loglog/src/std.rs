@@ -188,15 +188,10 @@ impl RawClient {
 
         self.conn.write_all(&buf)?;
 
-        // TODO: In the future, if there are multiple peers, we're going to need to read
-        // the allocation id first, call `Fill` on all of them, and then read the "done"
-        // byte
         let mut entry_log_offset_buf = [0u8; AllocationId::BYTE_SIZE + 1];
         let offset = {
             self.conn.read_exact(&mut entry_log_offset_buf)?;
 
-            // TODO: in the future here we will start sending the `raw_entry` to other peers
-            // right away using `Fill` call
             AllocationId::read(&mut Cursor::new(&entry_log_offset_buf))?
         };
 

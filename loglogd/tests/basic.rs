@@ -21,6 +21,34 @@ use common::*;
 // }
 
 #[test]
+fn basic_can_append_nocommit() -> anyhow::Result<()> {
+    // init_logging();
+
+    let server = TestLoglogd::new()?;
+
+    let mut client = server.new_client()?;
+
+    for _ in 0..10 {
+        client.append_nocommit(&[1, 2, 3])?;
+    }
+    Ok(())
+}
+
+#[test]
+fn basic_can_append() -> anyhow::Result<()> {
+    // init_logging();
+
+    let server = TestLoglogd::new()?;
+
+    let mut client = server.new_client()?;
+
+    for _ in 0..10 {
+        client.append(&[1, 2, 3])?;
+    }
+    Ok(())
+}
+
+#[test]
 fn basic_sanity() -> anyhow::Result<()> {
     // init_logging();
 

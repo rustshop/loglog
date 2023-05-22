@@ -24,7 +24,7 @@ pub const REQUEST_HEADER_SIZE: usize = 14;
 /// Request header- command
 ///
 /// Every request starts with a one byte command
-#[derive(FromPrimitive, IntoPrimitive, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(FromPrimitive, IntoPrimitive, Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 #[repr(u8)]
 #[derive(BinRead)]
 #[br(repr = u8)]
@@ -34,8 +34,8 @@ pub enum RequestHeaderCmd {
     Append = 8,
     /// Append an entry to the log
     AppendWait = 9,
-    /// Fill a previously allocated place in the log with data
-    Fill = 13,
+    // /// Fill a previously allocated place in the log with data
+    // Fill = 13,
     /// Read the log
     Read = 16,
     /// Read the log and wait if more not available
@@ -47,7 +47,7 @@ pub enum RequestHeaderCmd {
 }
 
 /// Arguments for [`RequestHeaderCmd::Append`]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 #[binrw]
 #[brw(big)]
 pub struct AppendRequestHeader {
@@ -55,7 +55,7 @@ pub struct AppendRequestHeader {
 }
 
 /// Arguments for [`RequestHeaderCmd::Fill`]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 #[binrw]
 #[brw(big)]
 pub struct FillRequestHeader {
@@ -64,7 +64,7 @@ pub struct FillRequestHeader {
 }
 
 /// Arguments for [`RequestHeaderCmd::Read`]
-#[derive(BinRead, BinWrite, Debug)]
+#[derive(BinRead, BinWrite, Debug, Copy, Clone)]
 #[br(big)]
 #[bw(big)]
 pub struct ReadRequestHeader {
@@ -72,7 +72,7 @@ pub struct ReadRequestHeader {
     pub limit: ReadDataSize,
 }
 
-#[derive(BinRead, BinWrite, Debug)]
+#[derive(BinRead, BinWrite, Debug, Copy, Clone)]
 #[br(big)]
 #[bw(big)]
 pub struct ReadDataSize(pub u32);

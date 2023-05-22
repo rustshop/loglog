@@ -2,12 +2,13 @@ use binrw::{BinRead, BinWrite};
 use convi::ExpectFrom;
 use loglogd_api::{
     AllocationId, AppendRequestHeader, ConnectionHello, EntryHeader, EntrySize, EntryTrailer,
-    FillRequestHeader, GetEndResponse, LogOffset, ReadDataSize, ReadRequestHeader,
-    RequestHeaderCmd, LOGLOGD_VERSION_0,
+    GetEndResponse, LogOffset, ReadDataSize, ReadRequestHeader, RequestHeaderCmd,
+    LOGLOGD_VERSION_0,
 };
 use std::{
     cmp,
     io::{self, Cursor},
+    mem,
     net::SocketAddr,
     os::fd::{AsRawFd, RawFd},
     sync::{atomic::Ordering, Arc},
@@ -16,12 +17,11 @@ use std::{
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    join,
     net::{TcpListener, TcpStream},
     sync::watch,
     time::{sleep, timeout},
 };
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace};
 
 use crate::{
     ioutil::vec_extend_to_at_least,
@@ -180,158 +180,134 @@ impl RequestHandlerInner {
         // and move straight to action.
         // let mut header_buf = [0u8; 14];
 
+        let mut buf = self.shared.pop_entry_buffer();
+
         // TODO: add timeouts?
         while !self.shared.is_node_shutting_down.load(Ordering::SeqCst) {
-            let mut buf = self.shared.pop_entry_buffer();
-            vec_extend_to_at_least(&mut buf, 14);
-
-            let res = stream.read_exact(&mut buf[..]).await;
-
-            if let Err(e) = res {
+            if let Err(e) = self.handle_connection_loop_inner(stream, &mut buf).await {
                 self.shared.put_entry_buffer(buf);
-                return Err(e.into());
-            }
-
-            let cursor = &mut Cursor::new(&buf[..14]);
-            let cmd = match RequestHeaderCmd::read(cursor) {
-                Ok(cmd) => cmd,
-                Err(e) => {
-                    self.shared.put_entry_buffer(buf);
-                    return Err(e.into());
-                }
+                return Err(e)?;
             };
-
-            match cmd {
-                RequestHeaderCmd::Peer => {
-                    todo!();
-                }
-                cmd @ (RequestHeaderCmd::Append | RequestHeaderCmd::AppendWait) => {
-                    let args = match AppendRequestHeader::read(cursor) {
-                        Ok(args) => args,
-                        Err(e) => {
-                            self.shared.put_entry_buffer(buf);
-                            return Err(e.into());
-                        }
-                    };
-                    debug!(cmd = ?cmd, args = ?args);
-
-                    self.handle_append_request(
-                        stream,
-                        buf,
-                        args.size,
-                        cmd == RequestHeaderCmd::AppendWait,
-                    )
-                    .await?;
-                }
-                RequestHeaderCmd::Fill => {
-                    let args = match FillRequestHeader::read(cursor) {
-                        Ok(args) => args,
-                        Err(e) => {
-                            self.shared.put_entry_buffer(buf);
-                            return Err(e.into());
-                        }
-                    };
-                    debug!(cmd = ?cmd, args = ?args);
-
-                    self.handle_fill_request(stream, buf, args.allocation_id, args.size)
-                        .await?;
-                }
-                cmd @ (RequestHeaderCmd::Read | RequestHeaderCmd::ReadWait) => {
-                    let args = match ReadRequestHeader::read(cursor) {
-                        Ok(args) => args,
-                        Err(e) => {
-                            self.shared.put_entry_buffer(buf);
-                            return Err(e.into());
-                        }
-                    };
-                    debug!(cmd = ?cmd, args = ?args);
-
-                    self.handle_read_request(
-                        stream,
-                        args.offset,
-                        args.limit,
-                        cmd == RequestHeaderCmd::ReadWait,
-                    )
-                    .await?;
-                }
-                RequestHeaderCmd::GetEnd => {
-                    debug!(cmd = ?cmd);
-
-                    self.handle_get_end_request(stream).await?;
-                }
-                RequestHeaderCmd::Other => Err(ConnectionError::Invalid)?,
-            }
         }
 
+        self.shared.put_entry_buffer(buf);
+
+        Ok(())
+    }
+
+    async fn handle_connection_loop_inner(
+        &self,
+        stream: &mut TcpStream,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), ConnectionError> {
+        vec_extend_to_at_least(buf, 14);
+        let res = stream.read_exact(&mut buf[..]).await;
+        if let Err(e) = res {
+            return Err(e.into());
+        }
+        let cursor = &mut Cursor::new(&buf[..14]);
+        let cmd = RequestHeaderCmd::read(cursor)?;
+        match cmd {
+            RequestHeaderCmd::Peer => {
+                todo!();
+            }
+            cmd @ (RequestHeaderCmd::Append | RequestHeaderCmd::AppendWait) => {
+                let args = AppendRequestHeader::read(cursor)?;
+                debug!(cmd = ?cmd, args = ?args);
+
+                self.handle_append_request(
+                    stream,
+                    buf,
+                    args.size,
+                    cmd == RequestHeaderCmd::AppendWait,
+                )
+                .await?;
+            }
+            // RequestHeaderCmd::Fill => {
+            //     let args = match FillRequestHeader::read(cursor) {
+            //         Ok(args) => args,
+            //         Err(e) => {
+            //             self.shared.put_entry_buffer(buf);
+            //             return Err(e.into());
+            //         }
+            //     };
+            //     debug!(cmd = ?cmd, args = ?args);
+
+            //     self.handle_fill_request(stream, buf, args.allocation_id, args.size)
+            //         .await?;
+            // }
+            cmd @ (RequestHeaderCmd::Read | RequestHeaderCmd::ReadWait) => {
+                let args = ReadRequestHeader::read(cursor)?;
+                debug!(cmd = ?cmd, args = ?args);
+
+                self.handle_read_request(
+                    stream,
+                    args.offset,
+                    args.limit,
+                    cmd == RequestHeaderCmd::ReadWait,
+                )
+                .await?;
+            }
+            RequestHeaderCmd::GetEnd => {
+                debug!(cmd = ?cmd);
+
+                self.handle_get_end_request(stream, buf).await?;
+            }
+            RequestHeaderCmd::Other => Err(ConnectionError::Invalid)?,
+        }
         Ok(())
     }
 
     async fn handle_append_request(
         &self,
         stream: &mut TcpStream,
-        buf: Vec<u8>,
+        buf: &mut Vec<u8>,
         entry_size: EntrySize,
         wait: bool,
     ) -> ConnectionResult<()> {
-        let allocation_id = self.shared.allocate_new_entry(entry_size);
+        let allocation_id = self.handle_fill_request(stream, buf, entry_size).await?;
 
-        let mut resp_buf = self.shared.pop_entry_buffer();
+        // let (fill_res, send_res) = join!(
+        //     async {
+        debug!("Sending response to append request");
+        let res_size = AllocationId::BYTE_SIZE + 1;
+        vec_extend_to_at_least(buf, res_size);
 
-        let (mut read, mut write) = tokio::io::split(stream);
+        buf[0..AllocationId::BYTE_SIZE].copy_from_slice(&allocation_id.to_bytes());
 
-        let (fill_res, send_res) = join!(
-            self.handle_fill_request(&mut read, buf, allocation_id, entry_size),
-            async {
-                debug!("Sending response to append request");
-                let res_size = AllocationId::BYTE_SIZE + 1;
-                vec_extend_to_at_least(&mut resp_buf, res_size);
+        if wait {
+            stream.write_all(&buf[..AllocationId::BYTE_SIZE]).await?;
+            let mut last_fsynced_log_offset_rx = self.last_fsynced_log_offset_rx.clone();
 
-                resp_buf[0..AllocationId::BYTE_SIZE].copy_from_slice(&allocation_id.to_bytes());
+            loop {
+                let last_fsynced_log_offset = *last_fsynced_log_offset_rx.borrow_and_update();
 
-                if wait {
-                    write
-                        .write_all(&resp_buf[..AllocationId::BYTE_SIZE])
-                        .await?;
-                    let mut last_fsynced_log_offset_rx = self.last_fsynced_log_offset_rx.clone();
-
-                    loop {
-                        let last_fsynced_log_offset =
-                            *last_fsynced_log_offset_rx.borrow_and_update();
-
-                        if last_fsynced_log_offset <= allocation_id.offset {
-                            if last_fsynced_log_offset_rx.changed().await.is_err() {
-                                return Ok(());
-                            }
-                        } else {
-                            resp_buf[AllocationId::BYTE_SIZE] = 0xff;
-                            write
-                                .write_all(&resp_buf[AllocationId::BYTE_SIZE..res_size])
-                                .await?;
-                            break;
-                        }
+                if last_fsynced_log_offset <= allocation_id.offset {
+                    if last_fsynced_log_offset_rx.changed().await.is_err() {
+                        return Ok(());
                     }
                 } else {
-                    resp_buf[AllocationId::BYTE_SIZE] = 0xff;
-                    write.write_all(&resp_buf[..res_size]).await?;
+                    buf[AllocationId::BYTE_SIZE] = 0xff;
+                    stream
+                        .write_all(&buf[AllocationId::BYTE_SIZE..res_size])
+                        .await?;
+                    break;
                 }
-                Ok(())
-            },
-        );
+            }
+        } else {
+            buf[AllocationId::BYTE_SIZE] = 0xff;
+            stream.write_all(&buf[..res_size]).await?;
+        }
 
-        self.shared.put_entry_buffer(resp_buf);
-
-        fill_res?;
-
-        send_res
+        Ok(())
     }
 
     async fn handle_fill_request(
         &self,
         stream: &mut (impl AsyncRead + Unpin),
-        mut buf: Vec<u8>,
-        allocation_id: AllocationId,
+        buf: &mut Vec<u8>,
         payload_size: EntrySize,
-    ) -> ConnectionResult<()> {
+    ) -> ConnectionResult<AllocationId> {
         async fn read_payload(
             mut stream: impl AsyncRead + Unpin,
             entry_buf: &mut [u8],
@@ -347,47 +323,19 @@ impl RequestHandlerInner {
                 )
                 .await?;
 
-            // uring_try_rec!(
-            //     entry_buf,
-            //     tcpstream_read_fill(
-            //         stream,
-            //         entry_buf.slice(
-            //             entry_header_size..(entry_header_size + usize::expect_from(payload_size.0))
-            //         )
-            //     )
-            //     .await
-            // );
-
             Ok(())
         }
 
         let entry_header_size = EntryHeader::BYTE_SIZE;
         let entry_trailer_size = EntryTrailer::BYTE_SIZE;
-        // TODO: allocation_id.term vs node.term
-        let header = EntryHeader {
-            term: allocation_id.term,
-            payload_size,
-        };
 
         let total_entry_size =
             entry_header_size + usize::expect_from(payload_size.0) + entry_trailer_size;
-        vec_extend_to_at_least(&mut buf, total_entry_size);
+        vec_extend_to_at_least(buf, total_entry_size);
 
-        header
-            .write(&mut Cursor::new(&mut buf[0..entry_header_size]))
-            .expect("Can't fail");
+        read_payload(stream, buf, payload_size).await?;
 
-        let read_res = read_payload(stream, &mut buf, payload_size).await;
-
-        let trailer = match &read_res {
-            Ok(()) => EntryTrailer::valid(),
-            Err(e) => {
-                warn!("Failed to read payload from client: {}", e);
-                EntryTrailer::invalid()
-            }
-        };
-
-        trailer
+        EntryTrailer::valid()
             .write(&mut Cursor::new(
                 &mut buf[total_entry_size - entry_trailer_size..total_entry_size],
             ))
@@ -395,17 +343,28 @@ impl RequestHandlerInner {
 
         buf.truncate(total_entry_size);
 
+        let allocation_id = self.shared.allocate_new_entry(payload_size);
+
+        // TODO: allocation_id.term vs node.term
+        let header = EntryHeader {
+            term: allocation_id.term,
+            payload_size,
+        };
+
+        header
+            .write(&mut Cursor::new(&mut buf[0..entry_header_size]))
+            .expect("Can't fail");
         // The other side should never be disconnected, but if it is,
         // we just move on without complaining.
         let _ = self
             .entry_writer_tx
             .send_async(EntryWrite {
                 offset: allocation_id.offset,
-                entry: buf,
+                entry: mem::replace(buf, self.shared.pop_entry_buffer()),
             })
             .await;
 
-        read_res
+        Ok(allocation_id)
     }
 
     async fn write_read_response_size(
@@ -604,17 +563,21 @@ impl RequestHandlerInner {
         Ok(())
     }
 
-    async fn handle_get_end_request(&self, stream: &mut TcpStream) -> ConnectionResult<()> {
+    async fn handle_get_end_request(
+        &self,
+        stream: &mut TcpStream,
+        #[allow(clippy::ptr_arg)] buf: &mut Vec<u8>,
+    ) -> ConnectionResult<()> {
         let resp = GetEndResponse {
             offset: self.shared.fsynced_log_offset(),
         };
 
-        let mut buf = self.shared.pop_entry_buffer();
-        resp.write(&mut binrw::io::NoSeek::new(&mut buf))?;
-        let res = stream.write_all(&buf).await;
+        resp.write(&mut binrw::io::NoSeek::new(
+            &mut buf[..GetEndResponse::BYTE_SIZE],
+        ))?;
+        stream.write_all(&buf[..GetEndResponse::BYTE_SIZE]).await?;
 
-        self.shared.put_entry_buffer(buf);
-        Ok(res?)
+        Ok(())
     }
 }
 
