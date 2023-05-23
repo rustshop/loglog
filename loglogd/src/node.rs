@@ -134,20 +134,25 @@ pub struct NodeShared {
 
     #[allow(unused)]
     id: NodeId,
-    pub term: TermId,
+
+    pub current_term: TermId,
+
     // TODO: split into buckets by size?
     entry_buffer_pool: Mutex<Vec<Vec<u8>>>,
 
     /// Entries already received and allocated, but not yet written
     entries_in_flight: RwLock<EntriesInFlight>,
 
+    /// Segment currently being written to
     open_segments: RwLock<OpenSegments>,
 
     /// Known segments, sorted by `stream_offset`
     sealed_segments: RwLock<SealedSegments>,
 
+    /// Up to which log_offset was the log fsynced to disk (all entries before already written at the time of fsync)
     fsynced_log_offset: AtomicU64,
-    last_fsynced_log_offset_tx: tokio::sync::watch::Sender<LogOffset>,
+    /// Used to notify threads waiting for `fsynced_log_offset` to advance
+    fsynced_log_offset_tx: tokio::sync::watch::Sender<LogOffset>,
 }
 
 impl NodeShared {
@@ -187,7 +192,7 @@ impl NodeShared {
         debug_assert!(was_inserted);
         let alloc = AllocationId {
             offset,
-            term: self.term,
+            term: self.current_term,
         };
 
         write_in_flight.next_available_log_offset =
@@ -320,7 +325,7 @@ impl Node {
             is_segment_writer_done: AtomicBool::new(false),
             is_node_shutting_down: is_node_shutting_down.clone(),
             id: NodeId(0),
-            term: TermId(0),
+            current_term: TermId(0),
             entry_buffer_pool: Mutex::new(vec![]),
             params: params.clone(),
             entries_in_flight: RwLock::new(EntriesInFlight {
@@ -336,7 +341,7 @@ impl Node {
                 preallocated_segments_rx: future_segments_rx,
             }),
             fsynced_log_offset: AtomicU64::new(0),
-            last_fsynced_log_offset_tx,
+            fsynced_log_offset_tx: last_fsynced_log_offset_tx,
         });
 
         let request_handler = RequestHandler::new(

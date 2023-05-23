@@ -180,6 +180,7 @@ impl PreallocatedSegment {
     }
 }
 
+/// A segment that is still being written to
 #[derive(Debug)]
 pub struct OpenSegment {
     pub id: SegmentId,

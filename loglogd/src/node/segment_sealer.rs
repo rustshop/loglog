@@ -135,7 +135,7 @@ impl SegmentSealer {
                         .store(first_unwritten_log_offset.as_u64(), Ordering::SeqCst);
                     // we don't care if everyone disconnected
                     let _ = shared
-                        .last_fsynced_log_offset_tx
+                        .fsynced_log_offset_tx
                         .send(first_unwritten_log_offset);
                 }
             }),
