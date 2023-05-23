@@ -10,6 +10,7 @@ pub use self::net::*;
 
 mod log;
 pub use self::log::*;
+
 /// Logical offset in an the binary log stream
 ///
 /// Clients use this offset directly to traverse the log and

@@ -234,12 +234,7 @@ impl WriteLoopInner {
                 (next_segment_start_log_offset, new_segment)
             };
 
-            self.shared.put_entry_buffer(
-                new_segment.write_file_header(
-                    new_segment_start_log_offset,
-                    self.shared.pop_entry_buffer(),
-                ),
-            );
+            new_segment.write_file_header(new_segment_start_log_offset);
 
             // It would be tempting to just return the `new_segment` as the segment we need. But that would be
             // a mistake - this entry might theoretically be so far ahead, that it needs even more segments opened.

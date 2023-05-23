@@ -1,4 +1,4 @@
-use crate::ioutil::{pwrite_all, vec_extend_to_at_least};
+use crate::ioutil::pwrite_all;
 use std::{
     fmt,
     fs::OpenOptions,
@@ -190,8 +190,8 @@ pub struct OpenSegment {
 }
 
 impl OpenSegment {
-    pub fn write_file_header(&self, log_offset: LogOffset, mut buf: Vec<u8>) -> Vec<u8> {
-        vec_extend_to_at_least(&mut buf, SegmentFileHeader::BYTE_SIZE);
+    pub fn write_file_header(&self, log_offset: LogOffset) {
+        let buf = [0u8; SegmentFileHeader::BYTE_SIZE];
 
         let header = SegmentFileHeader {
             version: 1,
@@ -199,17 +199,14 @@ impl OpenSegment {
             ff_end: (),
         };
 
-        header
-            .write(&mut Cursor::new(&mut buf))
-            .expect("can't fail");
+        header.write(&mut Cursor::new(buf)).expect("can't fail");
 
         let res = pwrite_all(self.fd.as_raw_fd(), 0, &buf[..SegmentFileHeader::BYTE_SIZE]);
 
         if let Err(e) = res {
+            // We can't really tolerate errors when writting to log
             panic!("IO Error when writting log: {}, crashing immediately", e);
         }
-
-        buf
     }
 }
 
