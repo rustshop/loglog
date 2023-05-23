@@ -107,12 +107,12 @@ impl SealedSegments {
     }
 }
 #[derive(Debug)]
-pub struct EntriesInFlight {
+pub struct PendingEntries {
     /// Next log offset to give out to incoming entry
     next_available_log_offset: LogOffset,
 
     /// Entries that were already allocated but were not yet written to storage
-    unwritten: BTreeSet<LogOffset>,
+    entries: BTreeSet<LogOffset>,
 }
 
 #[derive(Error, Debug)]
@@ -141,7 +141,7 @@ pub struct NodeShared {
     entry_buffer_pool: Mutex<Vec<Vec<u8>>>,
 
     /// Entries already received and allocated, but not yet written
-    entries_in_flight: RwLock<EntriesInFlight>,
+    pending_entries: RwLock<PendingEntries>,
 
     /// Segment currently being written to
     open_segments: RwLock<OpenSegments>,
@@ -192,10 +192,10 @@ impl NodeShared {
 
     /// Allocate a space in the event stream and return allocation id
     pub fn allocate_new_entry(self: &Arc<Self>, len: EntrySize) -> AllocationId {
-        let mut write_in_flight = self.entries_in_flight.write().expect("locking failed");
+        let mut write_in_flight = self.pending_entries.write().expect("locking failed");
 
         let offset = write_in_flight.next_available_log_offset;
-        let was_inserted = write_in_flight.unwritten.insert(offset);
+        let was_inserted = write_in_flight.entries.insert(offset);
         debug_assert!(was_inserted);
         let alloc = AllocationId {
             offset,
@@ -210,24 +210,24 @@ impl NodeShared {
         alloc
     }
 
-    pub fn get_first_unwritten_log_offset(&self) -> LogOffset {
-        let read_in_flight = self.entries_in_flight.read().expect("Locking failed");
+    pub fn get_first_pending_log_offset(&self) -> LogOffset {
+        let read_in_flight = self.pending_entries.read().expect("Locking failed");
         read_in_flight
-            .unwritten
+            .entries
             .iter()
             .next()
             .copied()
             .unwrap_or(read_in_flight.next_available_log_offset)
     }
 
-    pub fn get_first_unwritten_entry_offset_ge(
+    pub fn get_first_pending_entry_offset_ge(
         &self,
         offset_inclusive: LogOffset,
     ) -> Option<LogOffset> {
-        self.entries_in_flight
+        self.pending_entries
             .read()
             .expect("Locking failed")
-            .unwritten
+            .entries
             .range(offset_inclusive..)
             .next()
             .copied()
@@ -335,12 +335,12 @@ impl Node {
             current_term: TermId(0),
             entry_buffer_pool: Mutex::new(vec![]),
             params: params.clone(),
-            entries_in_flight: RwLock::new(EntriesInFlight {
+            pending_entries: RwLock::new(PendingEntries {
                 next_available_log_offset: segments
                     .last()
                     .map(|s| s.content_meta.end_log_offset)
                     .unwrap_or_default(),
-                unwritten: BTreeSet::new(),
+                entries: BTreeSet::new(),
             }),
             sealed_segments: RwLock::new(SealedSegments::from_iter(segments)),
             open_segments: RwLock::new(OpenSegments {

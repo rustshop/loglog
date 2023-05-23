@@ -36,10 +36,10 @@ impl SegmentSealer {
                     let _last_written_entry_log_offset =
                         last_written_entry_log_offset_rx.wait_timeout(Duration::from_secs(1));
 
-                    let first_unwritten_log_offset = shared.get_first_unwritten_log_offset();
+                    let first_pending_log_offset = shared.get_first_pending_log_offset();
 
                     // Termination condition. We sealed all the pending data and...
-                    if fsynced_log_offset == first_unwritten_log_offset {
+                    if fsynced_log_offset == first_pending_log_offset {
                         // if we're done with all the pending work, and the writting loop
                         // is done too, we can finish.
                         if shared.is_segment_writer_done.load(Ordering::SeqCst) {
@@ -48,19 +48,19 @@ impl SegmentSealer {
                         continue;
                     }
 
-                    Self::seal_segments_up_to(&shared, first_unwritten_log_offset);
+                    Self::seal_segments_up_to(&shared, first_pending_log_offset);
 
                     // Only after successfully looping and fsyncing and/or closing all matching open segments
                     // we update `last_fsynced_log_offset`
-                    fsynced_log_offset = first_unwritten_log_offset;
-                    shared.update_fsynced_log_offset(first_unwritten_log_offset);
+                    fsynced_log_offset = first_pending_log_offset;
+                    shared.update_fsynced_log_offset(first_pending_log_offset);
                 }
             }),
         }
     }
 
-    fn seal_segments_up_to(shared: &Arc<NodeShared>, first_unwritten_log_offset: LogOffset) {
-        'inner: loop {
+    fn seal_segments_up_to(shared: &Arc<NodeShared>, first_pending_log_offset: LogOffset) {
+        loop {
             let (first_segment, second_segment_start) = {
                 let read_open_segments = shared.open_segments.read().expect("Locking failed");
 
@@ -75,30 +75,31 @@ impl SegmentSealer {
             };
 
             let Some((open_segment_start, open_segment)) = first_segment else {
-                break 'inner;
+                return;
             };
 
             debug!(
                 segment_id = %open_segment.id,
                 segment_start_log_offset = %open_segment_start,
-                first_unwritten_log_offset = %first_unwritten_log_offset,
+                first_unwritten_log_offset = %first_pending_log_offset,
                 "fsync"
             );
             if let Err(e) = nix::unistd::fsync(open_segment.fd.as_raw_fd()) {
                 warn!(error = %e, "Could not fsync opened segment file");
-                break 'inner;
+                return;
             }
 
             let Some(open_segment_end ) = second_segment_start else {
-                // Until we have at lest two open segments, we won't close the first one.
-                // It's not a big deal, and avoids having to calculate the end of first
-                // segment.
-                break 'inner
+                // Until we have the second open segments, we do not know what is the end
+                // of the first one.
+                // It's not a big deal, we can wait. Nothing depends on it and we will
+                // happily serve data from open segments to the readers.
+                return;
             };
 
             // We can't seal a segment if there are still any pending writes to it.
-            if first_unwritten_log_offset < open_segment_end {
-                break 'inner;
+            if first_pending_log_offset < open_segment_end {
+                return;
             }
 
             let open_segment_offset_size = open_segment_end - open_segment_start;
@@ -129,7 +130,7 @@ impl SegmentSealer {
                 debug_assert!(removed.is_some());
             }
 
-            // continue 'inner - there might be more
+            // continue - there might be more
         }
     }
 }

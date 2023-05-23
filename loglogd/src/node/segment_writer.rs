@@ -177,13 +177,13 @@ impl WriteLoopInner {
             let next_segment_start_log_offset = if let Some(last_segment_info) = last_segment_info {
                 // It would be a mistake to consider current `entry_log_offset` as a beginning of
                 // next segment as we might have arrived here out of order. Instead - we can use
-                // `unwritten` to find first unwritten entry for new segment, and thus its starting
+                // `pending` to find first not yet written entry for new segment, and thus its starting
                 // byte.
                 self.shared
-                    .get_first_unwritten_entry_offset_ge(
+                    .get_first_pending_entry_offset_ge(
                         last_segment_info.end_of_allocation_log_offset,
                     )
-                    .expect("at very least this entry should be in `unwritten`")
+                    .expect("at very least this entry should be in `pending`")
             } else {
                 self.shared
                     .get_sealed_segments_end_log_offset()
@@ -244,12 +244,9 @@ impl WriteLoopInner {
 
     /// Mark the entry as written to disk (thought possibly not yet fsynced)
     pub fn mark_entry_written_no_notify(self: &Arc<Self>, log_offset: LogOffset) {
-        let mut write_in_flight = self
-            .shared
-            .entries_in_flight
-            .write()
-            .expect("Locking failed");
-        let was_removed = write_in_flight.unwritten.remove(&log_offset);
+        let mut pending_entries_write =
+            self.shared.pending_entries.write().expect("Locking failed");
+        let was_removed = pending_entries_write.entries.remove(&log_offset);
         debug_assert!(was_removed);
     }
 

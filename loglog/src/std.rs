@@ -179,7 +179,7 @@ impl RawClient {
             size: EntrySize(u32::expect_from(raw_entry.len())),
         };
 
-        // TODO: instead of copy, use `write_vectored_all` when it stabilizes
+        // TODO(perf): instead of copy, use `write_vectored_all` when it stabilizes
         // https://github.com/rust-lang/rust/issues/70436
         args.write(&mut NoSeek::new(&mut buf)).expect("can't fail");
 

@@ -413,7 +413,7 @@ impl RequestHandlerInner {
 
             let stream_fd = stream.as_raw_fd();
             let bytes_written = tokio::task::spawn_blocking(move || -> io::Result<u64> {
-                // TODO(perf): should we cache these somewhere in some LRU or something?
+                // TODO(perf): we should cache FDs to open sealed files somewhere in some LRU
                 let file = std::fs::File::open(segment.file_meta.path())?;
                 let file_fd = file.as_raw_fd();
                 send_file_to_stream(file_fd, file_offset, stream_fd, bytes_to_send)
