@@ -157,7 +157,14 @@ pub struct NodeShared {
 
 impl NodeShared {
     pub fn fsynced_log_offset(&self) -> LogOffset {
-        LogOffset::new(self.fsynced_log_offset.load(Ordering::Relaxed))
+        LogOffset::new(self.fsynced_log_offset.load(Ordering::SeqCst))
+    }
+
+    pub fn update_fsynced_log_offset(&self, log_offset: LogOffset) {
+        self.fsynced_log_offset
+            .store(log_offset.as_u64(), Ordering::SeqCst);
+        // we don't care if everyone disconnected
+        let _ = self.fsynced_log_offset_tx.send(log_offset);
     }
 
     /// Get a vector from a pool of vectors
