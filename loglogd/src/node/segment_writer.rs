@@ -51,10 +51,7 @@ impl SegmentWriter {
 
                             while let Ok(entry) = inner.rx.recv() {
                                 inner
-                                    .handle_entry_write(
-                                        entry,
-                                        &inner.last_written_entry_log_offset_tx,
-                                    )
+                                    .handle_entry_write(entry)
                                     .expect("Error while writting entry to segment file");
                             }
                         }
@@ -75,21 +72,18 @@ impl WriteLoopInner {
     /// Write an entry to the log
     fn handle_entry_write(
         self: &Arc<Self>,
-        entry: EntryWrite,
-        last_written_entry_log_offset_tx: &watch::WatchSender<LogOffset>,
+        EntryWrite { offset, entry }: EntryWrite,
     ) -> anyhow::Result<()> {
-        let EntryWrite { offset, entry } = entry;
-
         debug!(
             offset = offset.0,
             size = entry.len(),
-            "Received new entry write"
+            "Received new entry to write"
         );
 
-        let (segment_start_log_offset, segment) = self.get_segment_for_write(offset);
+        let segment = self.get_segment_for_write(offset);
 
         // TODO: check if we didn't already have this chunk, and if the offset seems valid (keep track in memory)
-        let file_offset = offset.0 - segment_start_log_offset.0 + SegmentFileHeader::BYTE_SIZE_U64;
+        let file_offset = offset.0 - segment.start_log_offset.0 + SegmentFileHeader::BYTE_SIZE_U64;
 
         debug!(
             offset = offset.0,
@@ -105,17 +99,19 @@ impl WriteLoopInner {
         }
 
         self.mark_entry_written(offset);
-        last_written_entry_log_offset_tx.send(offset);
 
         self.shared.put_entry_buffer(entry);
 
         Ok(())
     }
 
+    /// Find an open segment to write an entry at `entry_log_offset`
+    ///
+    /// Returns
     fn get_segment_for_write<'a>(
         self: &'a Arc<Self>,
         entry_log_offset: LogOffset,
-    ) -> (LogOffset, Arc<OpenSegment>) {
+    ) -> Arc<OpenSegment> {
         fn get_segment_for_offset(
             open_segments: &BTreeMap<LogOffset, Arc<OpenSegment>>,
             log_offset: LogOffset,
@@ -161,7 +157,8 @@ impl WriteLoopInner {
                     get_segment_for_offset(&read_open_segments.inner, entry_log_offset)
                 {
                     trace!(%entry_log_offset, ?segment, "found segment for entry write");
-                    return segment;
+                    assert_eq!(segment.0, segment.1.start_log_offset);
+                    return segment.1;
                 }
                 // Well.. seems like we need a new one... . Record the ending offset
                 let last_segment_info =
@@ -251,7 +248,8 @@ impl WriteLoopInner {
         }
     }
 
-    pub fn mark_entry_written(self: &Arc<Self>, log_offset: LogOffset) {
+    /// Mark the entry as written to disk (thought possibly not yet fsynced)
+    pub fn mark_entry_written_no_notify(self: &Arc<Self>, log_offset: LogOffset) {
         let mut write_in_flight = self
             .shared
             .entries_in_flight
@@ -259,5 +257,10 @@ impl WriteLoopInner {
             .expect("Locking failed");
         let was_removed = write_in_flight.unwritten.remove(&log_offset);
         debug_assert!(was_removed);
+    }
+
+    pub fn mark_entry_written(self: &Arc<Self>, log_offset: LogOffset) {
+        self.mark_entry_written_no_notify(log_offset);
+        self.last_written_entry_log_offset_tx.send(log_offset);
     }
 }

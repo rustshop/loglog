@@ -138,6 +138,7 @@ pub struct NodeShared {
     // TODO: split into buckets by size?
     entry_buffer_pool: Mutex<Vec<Vec<u8>>>,
 
+    /// Entries already received and allocated, but not yet written
     entries_in_flight: RwLock<EntriesInFlight>,
 
     open_segments: RwLock<OpenSegments>,
