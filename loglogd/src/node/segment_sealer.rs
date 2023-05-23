@@ -61,80 +61,75 @@ impl SegmentSealer {
 
     fn seal_segments_up_to(shared: &Arc<NodeShared>, first_unwritten_log_offset: LogOffset) {
         'inner: loop {
-            let read_open_segments = shared.open_segments.read().expect("Locking failed");
+            let (first_segment, second_segment_start) = {
+                let read_open_segments = shared.open_segments.read().expect("Locking failed");
 
-            let mut segments_iter = read_open_segments.inner.iter();
-            let first_segment = segments_iter
-                .next()
-                .map(|(offset, segment)| (*offset, Arc::clone(segment)));
-            let second_segment_start = segments_iter.next().map(|s| s.0).cloned();
-            drop(segments_iter);
-            drop(read_open_segments);
+                let mut segments_iter = read_open_segments.inner.iter();
 
-            if let Some((first_segment_start_log_offset, first_segment)) = first_segment {
-                debug!(
-                    segment_id = %first_segment.id,
-                    segment_start_log_offset = %first_segment_start_log_offset,
-                    first_unwritten_log_offset = %first_unwritten_log_offset,
-                    "fsync"
-                );
-                if let Err(e) = nix::unistd::fsync(first_segment.fd.as_raw_fd()) {
-                    warn!(error = %e, "Could not fsync opened segment file");
-                    break 'inner;
-                }
+                let first_segment = segments_iter
+                    .next()
+                    .map(|(offset, segment)| (*offset, Arc::clone(segment)));
+                let second_segment_start = segments_iter.next().map(|s| s.0).cloned();
 
-                let first_segment_end_log_offset = match second_segment_start {
-                    Some(v) => v,
-                    // Until we have at lest two open segments, we won't close the first one.
-                    // It's not a big deal, and avoids having to calculate the end of first
-                    // segment.
-                    None => break 'inner,
-                };
+                (first_segment, second_segment_start)
+            };
 
-                // Are all the pending writes to the first open segment complete? If so,
-                // we can close and seal it.
-                if first_segment_end_log_offset <= first_unwritten_log_offset {
-                    let first_segment_offset_size =
-                        first_segment_end_log_offset - first_segment_start_log_offset;
-                    // Note: we append to sealed segments first, and remove from open segments second. This way
-                    // any readers looking for their data can't miss it between removal and addition.
-                    {
-                        let sealed_segment = SegmentMeta {
-                            file_meta: SegmentFileMeta::new(
-                                first_segment.id,
-                                first_segment_offset_size + SegmentFileHeader::BYTE_SIZE_U64,
-                                SegmentFileMeta::get_path(
-                                    &shared.params.data_dir,
-                                    first_segment.id,
-                                ),
-                            ),
-                            content_meta: segment::SegmentContentMeta {
-                                start_log_offset: first_segment_start_log_offset,
-                                end_log_offset: first_segment_end_log_offset,
-                            },
-                        };
-                        shared
-                            .sealed_segments
-                            .write()
-                            .expect("Locking failed")
-                            .insert(first_segment_start_log_offset, sealed_segment);
-                    }
-                    {
-                        let mut write_open_segments =
-                            shared.open_segments.write().expect("Locking failed");
-                        let removed = write_open_segments
-                            .inner
-                            .remove(&first_segment_start_log_offset);
-                        debug_assert!(removed.is_some());
-                    }
-                } else {
-                    break 'inner;
-                }
+            let Some((open_segment_start, open_segment)) = first_segment else {
+                break 'inner;
+            };
 
-                // continue 'inner - there might be more
-            } else {
+            debug!(
+                segment_id = %open_segment.id,
+                segment_start_log_offset = %open_segment_start,
+                first_unwritten_log_offset = %first_unwritten_log_offset,
+                "fsync"
+            );
+            if let Err(e) = nix::unistd::fsync(open_segment.fd.as_raw_fd()) {
+                warn!(error = %e, "Could not fsync opened segment file");
                 break 'inner;
             }
+
+            let Some(open_segment_end ) = second_segment_start else {
+                // Until we have at lest two open segments, we won't close the first one.
+                // It's not a big deal, and avoids having to calculate the end of first
+                // segment.
+                break 'inner
+            };
+
+            // We can't seal a segment if there are still any pending writes to it.
+            if first_unwritten_log_offset < open_segment_end {
+                break 'inner;
+            }
+
+            let open_segment_offset_size = open_segment_end - open_segment_start;
+
+            // Note: we append to sealed segments first, and remove from open segments second. This way
+            // any readers looking for their data can't miss it between removal and addition.
+            {
+                let sealed_segment = SegmentMeta {
+                    file_meta: SegmentFileMeta::new(
+                        open_segment.id,
+                        open_segment_offset_size + SegmentFileHeader::BYTE_SIZE_U64,
+                        SegmentFileMeta::get_path(&shared.params.data_dir, open_segment.id),
+                    ),
+                    content_meta: segment::SegmentContentMeta {
+                        start_log_offset: open_segment_start,
+                        end_log_offset: open_segment_end,
+                    },
+                };
+                shared
+                    .sealed_segments
+                    .write()
+                    .expect("Locking failed")
+                    .insert(open_segment_start, sealed_segment);
+            }
+            {
+                let mut write_open_segments = shared.open_segments.write().expect("Locking failed");
+                let removed = write_open_segments.inner.remove(&open_segment_start);
+                debug_assert!(removed.is_some());
+            }
+
+            // continue 'inner - there might be more
         }
     }
 }
