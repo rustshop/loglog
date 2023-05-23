@@ -75,7 +75,7 @@ impl WriteLoopInner {
         EntryWrite { offset, entry }: EntryWrite,
     ) -> anyhow::Result<()> {
         debug!(
-            offset = offset.0,
+            offset = %offset,
             size = entry.len(),
             "Received new entry to write"
         );
@@ -83,10 +83,10 @@ impl WriteLoopInner {
         let segment = self.get_segment_for_write(offset);
 
         // TODO: check if we didn't already have this chunk, and if the offset seems valid (keep track in memory)
-        let file_offset = offset.0 - segment.start_log_offset.0 + SegmentFileHeader::BYTE_SIZE_U64;
+        let file_offset = offset - segment.start_log_offset + SegmentFileHeader::BYTE_SIZE_U64;
 
         debug!(
-            offset = offset.0,
+            offset = %offset,
             size = entry.len(),
             segment_id = %segment.id,
             segment_offset = file_offset,
@@ -133,7 +133,7 @@ impl WriteLoopInner {
             // It's the last one or we need a new one
             if let Some((last_start_log_offset, last)) = open_segments.last_key_value() {
                 debug_assert!(*last_start_log_offset <= log_offset);
-                let write_offset = log_offset.0 - last_start_log_offset.0;
+                let write_offset = log_offset - *last_start_log_offset;
                 if write_offset + SegmentFileHeader::BYTE_SIZE_U64 < last.allocated_size {
                     return Some((*last_start_log_offset, last.clone()));
                 }
@@ -165,11 +165,10 @@ impl WriteLoopInner {
                     read_open_segments
                         .inner
                         .last_key_value()
-                        .map(|s| LastSegmentInfo {
-                            start_log_offset: *s.0,
-                            end_of_allocation_log_offset: LogOffset(
-                                s.0 .0 + s.1.allocated_size - SegmentFileHeader::BYTE_SIZE_U64,
-                            ),
+                        .map(|(offset, segment)| LastSegmentInfo {
+                            start_log_offset: *offset,
+                            end_of_allocation_log_offset: *offset
+                                + (segment.allocated_size - SegmentFileHeader::BYTE_SIZE_U64),
                         });
                 drop(read_open_segments);
                 last_segment_info
@@ -188,7 +187,7 @@ impl WriteLoopInner {
             } else {
                 self.shared
                     .get_sealed_segments_end_log_offset()
-                    .unwrap_or(LogOffset(0))
+                    .unwrap_or_default()
             };
 
             // It wasn't one of the existing open segments, so we drop the lock fo reading

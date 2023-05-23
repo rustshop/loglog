@@ -76,7 +76,7 @@ async fn main() -> AppResult<()> {
                 .take(opts.entry_size)
                 .collect::<Vec<u8>>();
 
-            let mut client = RawClient::connect(opts.common.server_addr, Some(LogOffset(0)))
+            let mut client = RawClient::connect(opts.common.server_addr, Some(LogOffset::zero()))
                 .await
                 .report()
                 .change_context(AppError)?;

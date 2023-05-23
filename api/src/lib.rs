@@ -17,10 +17,18 @@ pub use self::log::*;
 ///
 /// Notably LogLog for performance reasons includes each entry's
 /// header and trailer the log, but segment file header is not included.
-#[derive(Copy, Clone, Debug, BinRead, BinWrite, PartialEq, Eq, PartialOrd, Ord, Display)]
+#[derive(
+    Copy, Clone, Debug, BinRead, BinWrite, PartialEq, Eq, PartialOrd, Ord, Display, Default,
+)]
 #[br(big)]
 #[bw(big)]
-pub struct LogOffset(pub u64);
+pub struct LogOffset(u64);
+
+impl ops::AddAssign<u64> for LogOffset {
+    fn add_assign(&mut self, rhs: u64) {
+        self.0 += rhs
+    }
+}
 
 impl ops::Add<u64> for LogOffset {
     type Output = Self;
@@ -34,7 +42,27 @@ impl ops::Sub<Self> for LogOffset {
     type Output = u64;
 
     fn sub(self, rhs: Self) -> Self::Output {
-        self.0 - rhs.0
+        self.0
+            .checked_sub(rhs.0)
+            .expect("LogOffset substraction underflow")
+    }
+}
+
+impl LogOffset {
+    pub fn zero() -> Self {
+        Self(0)
+    }
+
+    pub fn new(offset: u64) -> Self {
+        Self(offset)
+    }
+
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    pub fn saturating_sub(&self, rhs: LogOffset) -> u64 {
+        self.0.saturating_sub(rhs.0)
     }
 }
 

@@ -305,7 +305,7 @@ impl RawClient {
         self.buf.resize(new_len, 0);
         match self.conn.read_exact(&mut self.buf[prev_len..new_len]) {
             Ok(_read) => {
-                self.log_offset.0 += u64::from(data_size);
+                self.log_offset += u64::from(data_size);
             }
             Err(e) => {
                 // on failure, just discard any partially read data and move on

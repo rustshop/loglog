@@ -353,9 +353,10 @@ impl SegmentContentMeta {
                         content_meta: if file_pos != file_pos_log_data_start {
                             Some(SegmentContentMeta {
                                 start_log_offset: header.log_offset,
-                                end_log_offset: LogOffset(
-                                    header.log_offset.0 + file_pos - file_pos_log_data_start,
-                                ),
+                                end_log_offset: header.log_offset
+                                    + (file_pos
+                                        .checked_sub(file_pos_log_data_start)
+                                        .expect("file_pos substraction underflow")),
                             })
                         } else {
                             None
@@ -409,7 +410,10 @@ impl SegmentContentMeta {
 
         Ok(Ok(SegmentContentMeta {
             start_log_offset: header.log_offset,
-            end_log_offset: LogOffset(header.log_offset.0 + file_pos - file_pos_log_data_start),
+            end_log_offset: header.log_offset
+                + (file_pos
+                    .checked_sub(file_pos_log_data_start)
+                    .expect("file_pos substraction underflow")),
         }))
     }
 

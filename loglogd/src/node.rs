@@ -152,7 +152,7 @@ pub struct NodeShared {
 
 impl NodeShared {
     pub fn fsynced_log_offset(&self) -> LogOffset {
-        LogOffset(self.fsynced_log_offset.load(Ordering::Relaxed))
+        LogOffset::new(self.fsynced_log_offset.load(Ordering::Relaxed))
     }
 
     /// Get a vector from a pool of vectors
@@ -190,11 +190,10 @@ impl NodeShared {
             term: self.term,
         };
 
-        write_in_flight.next_available_log_offset = LogOffset(
-            offset.0 + EntryHeader::BYTE_SIZE_U64 + u64::from(len.0) + EntryTrailer::BYTE_SIZE_U64,
-        );
+        write_in_flight.next_available_log_offset =
+            offset + EntryHeader::BYTE_SIZE_U64 + u64::from(len.0) + EntryTrailer::BYTE_SIZE_U64;
 
-        trace!(offset = alloc.offset.0, "Allocated new entry");
+        trace!(offset = %alloc.offset, "Allocated new entry");
 
         alloc
     }
@@ -312,9 +311,9 @@ impl Node {
         let (entry_writer_tx, entry_writer_rx) = flume::bounded(16);
         let (future_segments_tx, future_segments_rx) = flume::bounded(4);
         let (last_fsynced_log_offset_tx, last_fsynced_log_offset_rx) =
-            tokio::sync::watch::channel(LogOffset(0));
+            tokio::sync::watch::channel(LogOffset::zero());
         let (last_written_entry_log_offset_tx, last_written_entry_log_offset_rx) =
-            watch::channel(LogOffset(0));
+            watch::channel(LogOffset::zero());
 
         let is_node_shutting_down = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(NodeShared {
@@ -328,7 +327,7 @@ impl Node {
                 next_available_log_offset: segments
                     .last()
                     .map(|s| s.content_meta.end_log_offset)
-                    .unwrap_or(LogOffset(0)),
+                    .unwrap_or_default(),
                 unwritten: BTreeSet::new(),
             }),
             sealed_segments: RwLock::new(SealedSegments::from_iter(segments)),

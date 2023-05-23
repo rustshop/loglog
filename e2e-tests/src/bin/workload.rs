@@ -24,7 +24,7 @@ async fn main() -> AppResult<()> {
 
     let opts = loglog_e2e::Opts::from_args();
 
-    let mut client = RawClient::connect(opts.server_addr, Some(LogOffset(0)))
+    let mut client = RawClient::connect(opts.server_addr, Some(LogOffset::zero()))
         .await
         .report()
         .change_context(AppError)?;

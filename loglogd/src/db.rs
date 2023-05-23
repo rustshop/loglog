@@ -110,9 +110,9 @@ pub fn load_db(data_dir: &Path) -> ScanResult<Vec<SegmentMeta>> {
         let first = segments.first().expect("no empty");
         let last = segments.last().expect("not empty");
         info!(
-            start_pos = first.content_meta.start_log_offset.0,
+            start_pos = %first.content_meta.start_log_offset,
             start_segment = %first.file_meta.id,
-            end_post = last.content_meta.end_log_offset.0,
+            end_post = %last.content_meta.end_log_offset,
             end_segment = %last.file_meta.id,
             num_segments = segments.len(),
             "Segments loaded"
@@ -134,7 +134,7 @@ pub fn open_and_recover(
         .open(&path)?;
     match SegmentContentMeta::read_from_file(file_meta, &file)? {
         Ok(o) => {
-            debug!(start_log_offset = o.start_log_offset.0, end_log_offset = o.end_log_offset.0, path = ?path.display(), "segment file cleanly opened");
+            debug!(start_log_offset = %o.start_log_offset, end_log_offset = %o.end_log_offset, path = ?path.display(), "segment file cleanly opened");
             Ok(Some(o))
         }
         Err(SegmentParseError { r#type: type_, res }) => {

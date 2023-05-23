@@ -63,8 +63,8 @@ impl SegmentSealer {
                         {
                             debug!(
                                 segment_id = %first_segment.id,
-                                segment_start_log_offset = first_segment_start_log_offset.0,
-                                first_unwritten_log_offset = first_unwritten_log_offset.0,
+                                segment_start_log_offset = %first_segment_start_log_offset,
+                                first_unwritten_log_offset = %first_unwritten_log_offset,
                                 "fsync"
                             );
                             if let Err(e) = nix::unistd::fsync(first_segment.fd.as_raw_fd()) {
@@ -83,8 +83,8 @@ impl SegmentSealer {
                             // Are all the pending writes to the first open segment complete? If so,
                             // we can close and seal it.
                             if first_segment_end_log_offset <= first_unwritten_log_offset {
-                                let first_segment_offset_size = first_segment_end_log_offset.0
-                                    - first_segment_start_log_offset.0;
+                                let first_segment_offset_size =
+                                    first_segment_end_log_offset - first_segment_start_log_offset;
                                 // Note: we append to sealed segments first, and remove from open segments second. This way
                                 // any readers looking for their data can't miss it between removal and addition.
                                 {
@@ -132,7 +132,7 @@ impl SegmentSealer {
                     // we update `last_fsynced_log_offset`
                     shared
                         .fsynced_log_offset
-                        .store(first_unwritten_log_offset.0, Ordering::SeqCst);
+                        .store(first_unwritten_log_offset.as_u64(), Ordering::SeqCst);
                     // we don't care if everyone disconnected
                     let _ = shared
                         .last_fsynced_log_offset_tx

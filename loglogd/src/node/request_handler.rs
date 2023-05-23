@@ -397,8 +397,8 @@ impl RequestHandlerInner {
             }
 
             debug_assert!(segment.content_meta.start_log_offset <= *log_offset);
-            let bytes_available_in_segment = segment.content_meta.end_log_offset.0 - log_offset.0;
-            let file_offset = log_offset.0 - segment.content_meta.start_log_offset.0
+            let bytes_available_in_segment = segment.content_meta.end_log_offset - *log_offset;
+            let file_offset = *log_offset - segment.content_meta.start_log_offset
                 + SegmentFileHeader::BYTE_SIZE_U64;
 
             debug_assert!(0 < bytes_available_in_segment);
@@ -421,7 +421,7 @@ impl RequestHandlerInner {
             .await??;
 
             *num_bytes_to_send -= u32::expect_from(bytes_written);
-            log_offset.0 += bytes_written;
+            *log_offset += bytes_written;
         }
 
         // if more data is still needed, it's probably in the still opened buffers
@@ -449,16 +449,16 @@ impl RequestHandlerInner {
                 } else {
                     // No open segments after current one (at least yet).
                     // Just use request data as the end pointer
-                    LogOffset(log_offset.0 + u64::from(*num_bytes_to_send))
+                    *log_offset + u64::from(*num_bytes_to_send)
                 };
 
                 (segment, segment_end_log_offset)
             };
 
             debug_assert!(segment.start_log_offset <= *log_offset);
-            let bytes_available_in_segment = segment_end_log_offset.0 - log_offset.0;
+            let bytes_available_in_segment = segment_end_log_offset - *log_offset;
             let file_offset =
-                log_offset.0 - segment.start_log_offset.0 + SegmentFileHeader::BYTE_SIZE_U64;
+                *log_offset - segment.start_log_offset + SegmentFileHeader::BYTE_SIZE_U64;
 
             debug_assert!(0 < bytes_available_in_segment);
 
@@ -480,7 +480,7 @@ impl RequestHandlerInner {
             .await??;
 
             *num_bytes_to_send -= u32::expect_from(bytes_written);
-            log_offset.0 += bytes_written;
+            *log_offset += bytes_written;
         }
         Ok(())
     }
@@ -498,11 +498,7 @@ impl RequestHandlerInner {
         let mut num_bytes_to_send = loop {
             let last_fsynced_log_offset = *last_fsynced_log_offset_rx.borrow_and_update();
 
-            let commited_data_available = if log_offset < last_fsynced_log_offset {
-                last_fsynced_log_offset.0 - log_offset.0
-            } else {
-                0
-            };
+            let commited_data_available = last_fsynced_log_offset.saturating_sub(log_offset);
 
             let num_bytes_to_send =
                 u32::expect_from(cmp::min(u64::from(limit.0), commited_data_available));
