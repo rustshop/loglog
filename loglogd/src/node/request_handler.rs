@@ -182,7 +182,7 @@ impl RequestHandlerInner {
 
         let mut buf = self.shared.pop_entry_buffer();
 
-        // TODO: add timeouts?
+        // TODO: add timeouts for idle connections?
         while !self.shared.is_node_shutting_down.load(Ordering::SeqCst) {
             if let Err(e) = self.handle_connection_loop_inner(stream, &mut buf).await {
                 self.shared.put_entry_buffer(buf);

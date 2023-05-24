@@ -192,9 +192,6 @@ impl RawClient {
                 conn_read.read_exact(&mut entry_log_offset_buf).await?;
 
                 let allocation_id = AllocationId::read(&mut Cursor::new(&entry_log_offset_buf));
-                // TODO: in the future here we will start sending the `raw_entry` to other peers
-                // right away using `Fill` call
-
                 Ok(allocation_id)
             },
             conn_write.write_all(&buf)

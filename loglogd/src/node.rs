@@ -8,6 +8,7 @@ use crate::node::request_handler::RequestHandler;
 use crate::node::segment_preallocator::SegmentPreallocator;
 use crate::node::segment_sealer::SegmentSealer;
 use crate::node::segment_writer::SegmentWriter;
+use crate::raft;
 use crate::segment::{OpenSegment, PreallocatedSegment, SegmentMeta};
 use loglogd_api::{AllocationId, EntryHeader, EntrySize, EntryTrailer, LogOffset, NodeId, TermId};
 use signal_hook::consts::TERM_SIGNALS;
@@ -98,6 +99,14 @@ impl FromIterator<SegmentMeta> for SealedSegments {
 }
 
 impl SealedSegments {
+    /// `end_log_offset` of the last sealed segment
+    pub fn end_log_offset(&self) -> Option<LogOffset> {
+        self.inner
+            .range(..)
+            .next_back()
+            .map(|s| s.1.content_meta.end_log_offset)
+    }
+
     fn get_containing_offset(&self, offset: LogOffset) -> Option<&SegmentMeta> {
         self.inner.range(..=offset).next_back().map(|s| s.1)
     }
@@ -132,10 +141,7 @@ pub struct NodeShared {
 
     is_segment_writer_done: AtomicBool,
 
-    #[allow(unused)]
-    id: NodeId,
-
-    pub current_term: TermId,
+    persistent_state: raft::PersistentState,
 
     // TODO: split into buckets by size?
     entry_buffer_pool: Mutex<Vec<Vec<u8>>>,
@@ -153,6 +159,8 @@ pub struct NodeShared {
     fsynced_log_offset: AtomicU64,
     /// Used to notify threads waiting for `fsynced_log_offset` to advance
     fsynced_log_offset_tx: tokio::sync::watch::Sender<LogOffset>,
+
+    commited_log_offset: AtomicU64,
 }
 
 impl NodeShared {
@@ -199,7 +207,7 @@ impl NodeShared {
         debug_assert!(was_inserted);
         let alloc = AllocationId {
             offset,
-            term: self.current_term,
+            term: self.persistent_state.current_term,
         };
 
         write_in_flight.next_available_log_offset =
@@ -328,27 +336,31 @@ impl Node {
             watch::channel(LogOffset::zero());
 
         let is_node_shutting_down = Arc::new(AtomicBool::new(false));
+        let sealed_segments = SealedSegments::from_iter(segments);
+        let last_fsynced_offset = sealed_segments.end_log_offset();
+
         let shared = Arc::new(NodeShared {
             is_segment_writer_done: AtomicBool::new(false),
             is_node_shutting_down: is_node_shutting_down.clone(),
-            id: NodeId(0),
-            current_term: TermId(0),
+            persistent_state: raft::PersistentState {
+                id: NodeId(0),
+                current_term: TermId(0),
+                voted_for: None,
+            },
             entry_buffer_pool: Mutex::new(vec![]),
             params: params.clone(),
             pending_entries: RwLock::new(PendingEntries {
-                next_available_log_offset: segments
-                    .last()
-                    .map(|s| s.content_meta.end_log_offset)
-                    .unwrap_or_default(),
+                next_available_log_offset: sealed_segments.end_log_offset().unwrap_or_default(),
                 entries: BTreeSet::new(),
             }),
-            sealed_segments: RwLock::new(SealedSegments::from_iter(segments)),
+            sealed_segments: RwLock::new(sealed_segments),
             open_segments: RwLock::new(OpenSegments {
                 inner: BTreeMap::new(),
                 preallocated_segments_rx: future_segments_rx,
             }),
-            fsynced_log_offset: AtomicU64::new(0),
+            fsynced_log_offset: AtomicU64::new(last_fsynced_offset.unwrap_or_default().as_u64()),
             fsynced_log_offset_tx: last_fsynced_log_offset_tx,
+            commited_log_offset: AtomicU64::new(0),
         });
 
         let request_handler = RequestHandler::new(
