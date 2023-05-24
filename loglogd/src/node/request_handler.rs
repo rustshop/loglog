@@ -130,48 +130,56 @@ impl RequestHandlerInner {
             let self_copy = self.clone();
             tokio::spawn({
                 async move {
-                    if let Err(e) = self_copy.handle_connection(&mut stream).await {
+                    let mut buf = self_copy.shared.pop_entry_buffer();
+                    if let Err(e) = self_copy.handle_connection(&mut stream, &mut buf).await {
                         info!("Connection error: {}", e);
                     }
+                    self_copy.shared.put_entry_buffer(buf);
                 }
             });
         }
     }
 
-    pub async fn handle_connection(&self, stream: &mut TcpStream) -> ConnectionResult<()> {
+    pub async fn handle_connection(
+        &self,
+        stream: &mut TcpStream,
+        buf: &mut Vec<u8>,
+    ) -> ConnectionResult<()> {
         // We always prepare exact buffers to be sent immediately
         stream.set_nodelay(true)?;
-        self.handle_connection_init(stream).await?;
-        self.handle_connection_loop(stream).await?;
+        self.handle_connection_init(stream, buf).await?;
+        self.handle_connection_loop(stream, buf).await?;
         Ok(())
     }
 
     /// Handle connection
-    pub async fn handle_connection_init(&self, stream: &mut TcpStream) -> ConnectionResult<()> {
+    pub async fn handle_connection_init(
+        &self,
+        stream: &mut TcpStream,
+        buf: &mut Vec<u8>,
+    ) -> ConnectionResult<()> {
         let hello = ConnectionHello {
             version: LOGLOGD_VERSION_0,
         };
+        vec_extend_to_at_least(buf, ConnectionHello::BYTE_SIZE);
 
-        let mut buf = self.shared.pop_entry_buffer();
-        hello.write(&mut binrw::io::NoSeek::new(&mut buf))?;
-        let res = stream.write_all(&buf).await;
-        self.shared.put_entry_buffer(buf);
-        Ok(res?)
+        hello.write(&mut binrw::io::NoSeek::new(
+            &mut buf[..ConnectionHello::BYTE_SIZE],
+        ))?;
+        stream.write_all(buf).await?;
+        Ok(())
     }
 
     /// Handle connection
-    pub async fn handle_connection_loop(&self, stream: &mut TcpStream) -> ConnectionResult<()> {
-        let mut buf = self.shared.pop_entry_buffer();
-
+    pub async fn handle_connection_loop(
+        &self,
+        stream: &mut TcpStream,
+        buf: &mut Vec<u8>,
+    ) -> ConnectionResult<()> {
         // TODO: add timeouts for idle connections?
         while !self.shared.is_node_shutting_down.load(Ordering::SeqCst) {
-            if let Err(e) = self.handle_connection_loop_inner(stream, &mut buf).await {
-                self.shared.put_entry_buffer(buf);
-                return Err(e)?;
-            };
+            self.handle_connection_loop_inner(stream, buf).await?;
         }
-
-        self.shared.put_entry_buffer(buf);
 
         Ok(())
     }
@@ -199,12 +207,8 @@ impl RequestHandlerInner {
 
         debug_assert_eq!(Request::BYTE_SIZE, 14);
         vec_extend_to_at_least(buf, Request::BYTE_SIZE);
-        let res = stream.read_exact(&mut buf[..]).await;
-        if let Err(e) = res {
-            return Err(e.into());
-        }
-        let cursor = &mut Cursor::new(&buf[..14]);
-        let cmd = Request::read(cursor)?;
+        stream.read_exact(&mut buf[..Request::BYTE_SIZE]).await?;
+        let cmd = Request::read(&mut Cursor::new(&buf))?;
         match cmd {
             cmd @ (Request::Append(args) | Request::AppendWait(args)) => {
                 debug!(cmd = ?cmd, args = ?args);
@@ -246,8 +250,6 @@ impl RequestHandlerInner {
     ) -> ConnectionResult<()> {
         let allocation_id = self.handle_fill_request(stream, buf, entry_size).await?;
 
-        // let (fill_res, send_res) = join!(
-        //     async {
         debug!("Sending response to append request");
         let res_size = AllocationId::BYTE_SIZE + 1;
         vec_extend_to_at_least(buf, res_size);

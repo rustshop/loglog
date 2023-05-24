@@ -160,6 +160,8 @@ pub struct NodeShared {
     /// Used to notify threads waiting for `fsynced_log_offset` to advance
     fsynced_log_offset_tx: tokio::sync::watch::Sender<LogOffset>,
 
+    /// Last commited (globaly) log offset
+    #[allow(unused)] // TODO
     commited_log_offset: AtomicU64,
 }
 
