@@ -1,9 +1,8 @@
 use binrw::{BinRead, BinWrite};
 use convi::ExpectFrom;
 use loglogd_api::{
-    AllocationId, AppendRequestHeader, ConnectionHello, EntryHeader, EntrySize, EntryTrailer,
-    GetEndResponse, LogOffset, ReadDataSize, ReadRequestHeader, RequestHeaderCmd,
-    LOGLOGD_VERSION_0,
+    AllocationId, ConnectionHello, EntryHeader, EntrySize, EntryTrailer, GetEndResponse, LogOffset,
+    ReadDataSize, Request, LOGLOGD_VERSION_0,
 };
 use std::{
     cmp,
@@ -33,8 +32,6 @@ use super::NodeShared;
 
 #[derive(Error, Debug)]
 pub enum ConnectionError {
-    #[error("invalid data")]
-    Invalid,
     #[error("invalid data: {0}")]
     ParseError(#[from] binrw::Error),
     #[error("io: {0}")]
@@ -164,22 +161,6 @@ impl RequestHandlerInner {
 
     /// Handle connection
     pub async fn handle_connection_loop(&self, stream: &mut TcpStream) -> ConnectionResult<()> {
-        // Header breakdown:
-        // * 1B - cmd + basic args
-        // * if Append
-        //   * 3B event size
-        // * if Fill:
-        //   * 3B size
-        //   * 10B allocation id
-        // * if Read:
-        //   * 8B - stream offset
-        // * if Peer commands
-        //   * TBD: something else, but short
-        //
-        // Max: 14B of constant header, so we can read constant header once
-        // and move straight to action.
-        // let mut header_buf = [0u8; 14];
-
         let mut buf = self.shared.pop_entry_buffer();
 
         // TODO: add timeouts for idle connections?
@@ -200,47 +181,58 @@ impl RequestHandlerInner {
         stream: &mut TcpStream,
         buf: &mut Vec<u8>,
     ) -> Result<(), ConnectionError> {
-        vec_extend_to_at_least(buf, 14);
+        // Header breakdown:
+        // * 1B - cmd + basic args
+        // * if Append
+        //   * 3B event size
+        // * if Fill:
+        //   * 3B size
+        //   * 10B allocation id
+        // * if Read:
+        //   * 8B - stream offset
+        // * if Peer commands
+        //   * TBD: something else, but short
+        //
+        // Max: 14B of constant header, so we can read constant header once
+        // and move straight to action.
+        // let mut header_buf = [0u8; 14];
+
+        debug_assert_eq!(Request::BYTE_SIZE, 14);
+        vec_extend_to_at_least(buf, Request::BYTE_SIZE);
         let res = stream.read_exact(&mut buf[..]).await;
         if let Err(e) = res {
             return Err(e.into());
         }
         let cursor = &mut Cursor::new(&buf[..14]);
-        let cmd = RequestHeaderCmd::read(cursor)?;
+        let cmd = Request::read(cursor)?;
         match cmd {
-            RequestHeaderCmd::Peer => {
-                todo!();
-            }
-            cmd @ (RequestHeaderCmd::Append | RequestHeaderCmd::AppendWait) => {
-                let args = AppendRequestHeader::read(cursor)?;
+            cmd @ (Request::Append(args) | Request::AppendWait(args)) => {
                 debug!(cmd = ?cmd, args = ?args);
 
                 self.handle_append_request(
                     stream,
                     buf,
                     args.size,
-                    cmd == RequestHeaderCmd::AppendWait,
+                    matches!(cmd, Request::AppendWait(_)),
                 )
                 .await?;
             }
-            cmd @ (RequestHeaderCmd::Read | RequestHeaderCmd::ReadWait) => {
-                let args = ReadRequestHeader::read(cursor)?;
+            cmd @ (Request::Read(args) | Request::ReadWait(args)) => {
                 debug!(cmd = ?cmd, args = ?args);
 
                 self.handle_read_request(
                     stream,
                     args.offset,
                     args.limit,
-                    cmd == RequestHeaderCmd::ReadWait,
+                    matches!(cmd, Request::ReadWait(_)),
                 )
                 .await?;
             }
-            RequestHeaderCmd::GetEnd => {
+            Request::GetEnd => {
                 debug!(cmd = ?cmd);
 
                 self.handle_get_end_request(stream, buf).await?;
             }
-            RequestHeaderCmd::Other => Err(ConnectionError::Invalid)?,
         }
         Ok(())
     }

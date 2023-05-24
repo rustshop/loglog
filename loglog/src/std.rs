@@ -3,8 +3,7 @@ use binrw::{BinRead, BinWrite};
 use convi::{CastFrom, ExpectFrom};
 use loglogd_api::{
     AllocationId, AppendRequestHeader, ConnectionHello, EntryHeader, EntrySize, EntryTrailer,
-    GetEndResponse, ReadDataSize, ReadRequestHeader, RequestHeaderCmd, LOGLOGD_VERSION_0,
-    REQUEST_HEADER_SIZE,
+    GetEndResponse, ReadDataSize, ReadRequestHeader, Request, RequestHeaderCmd, LOGLOGD_VERSION_0,
 };
 use std::io::{Cursor, Read, Write};
 use std::net::SocketAddr;
@@ -163,7 +162,7 @@ impl RawClient {
     fn append_inner(&mut self, raw_entry: &[u8], wait: bool) -> Result<LogOffset> {
         debug!(size = raw_entry.len(), "Appending new entry");
 
-        let mut buf = Vec::with_capacity(REQUEST_HEADER_SIZE + raw_entry.len());
+        let mut buf = Vec::with_capacity(Request::BYTE_SIZE + raw_entry.len());
 
         std::io::Write::write_all(
             &mut buf,
@@ -183,7 +182,7 @@ impl RawClient {
         // https://github.com/rust-lang/rust/issues/70436
         args.write(&mut NoSeek::new(&mut buf)).expect("can't fail");
 
-        buf.resize(REQUEST_HEADER_SIZE, 0);
+        buf.resize(Request::BYTE_SIZE, 0);
         buf.extend_from_slice(raw_entry);
 
         self.conn.write_all(&buf)?;
@@ -226,7 +225,7 @@ impl RawClient {
     }
 
     fn inner_get_end(conn: &mut TcpStream) -> Result<LogOffset> {
-        let mut cmd_buf = [0u8; REQUEST_HEADER_SIZE];
+        let mut cmd_buf = [0u8; Request::BYTE_SIZE];
 
         let mut cursor = Cursor::new(&mut cmd_buf[0..]);
 
@@ -254,7 +253,7 @@ impl RawClient {
         limit: u32,
         wait: bool,
     ) -> Result<u32> {
-        let mut cmd_buf = [0u8; REQUEST_HEADER_SIZE];
+        let mut cmd_buf = [0u8; Request::BYTE_SIZE];
 
         let mut cursor = Cursor::new(&mut cmd_buf[0..]);
 

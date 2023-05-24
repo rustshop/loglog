@@ -20,14 +20,13 @@ impl ConnectionHello {
     pub const BYTE_SIZE: usize = 1;
 }
 
-pub const REQUEST_HEADER_SIZE: usize = 14;
 /// Request header- command
 ///
 /// Every request starts with a one byte command
 #[derive(FromPrimitive, IntoPrimitive, Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 #[repr(u8)]
-#[derive(BinRead)]
-#[br(repr = u8)]
+#[binrw]
+#[brw(repr = u8)]
 pub enum RequestHeaderCmd {
     Peer = 0,
     /// Append an entry to the log
@@ -46,8 +45,28 @@ pub enum RequestHeaderCmd {
     Other,
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[binrw]
+#[brw(big)]
+pub enum Request {
+    #[brw(magic(8u8))]
+    Append(AppendRequestHeader),
+    #[brw(magic(9u8))]
+    AppendWait(AppendRequestHeader),
+    #[brw(magic(16u8))]
+    Read(ReadRequestHeader),
+    #[brw(magic(17u8))]
+    ReadWait(ReadRequestHeader),
+    #[brw(magic(32u8))]
+    GetEnd,
+}
+
+impl Request {
+    pub const BYTE_SIZE: usize = 14;
+}
+
 /// Arguments for [`RequestHeaderCmd::Append`]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[binrw]
 #[brw(big)]
 pub struct AppendRequestHeader {
@@ -64,15 +83,15 @@ pub struct FillRequestHeader {
 }
 
 /// Arguments for [`RequestHeaderCmd::Read`]
-#[derive(BinRead, BinWrite, Debug, Copy, Clone)]
-#[br(big)]
-#[bw(big)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[binrw]
+#[brw(big)]
 pub struct ReadRequestHeader {
     pub offset: LogOffset,
     pub limit: ReadDataSize,
 }
 
-#[derive(BinRead, BinWrite, Debug, Copy, Clone)]
+#[derive(BinRead, BinWrite, Debug, Copy, Clone, PartialEq, Eq)]
 #[br(big)]
 #[bw(big)]
 pub struct ReadDataSize(pub u32);

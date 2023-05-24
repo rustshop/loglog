@@ -124,7 +124,7 @@ pub struct TermId(pub u16);
 /// Even though the type here is `u32`, we store (read&write)
 /// only 3Bs - it's just there's no better type to put it in
 /// (like `u24`).
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[binrw]
 #[brw(big)]
 pub struct EntrySize(
