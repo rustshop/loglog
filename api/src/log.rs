@@ -28,8 +28,8 @@ pub struct EntryHeader {
 }
 
 impl EntryHeader {
-    pub const BYTE_SIZE: usize = 5;
-    pub const BYTE_SIZE_U64: u64 = 5;
+    pub const BYTE_SIZE: usize = TermId::BYTE_SIZE + EntrySize::BYTE_SIZE;
+    pub const BYTE_SIZE_U64: u64 = Self::BYTE_SIZE as u64;
 }
 
 /// Entry suffix.

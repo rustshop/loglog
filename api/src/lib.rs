@@ -88,14 +88,14 @@ pub struct AllocationId {
 }
 
 impl AllocationId {
-    pub const BYTE_SIZE: usize = 10;
+    pub const BYTE_SIZE: usize = TermId::BYTE_SIZE + LogOffset::BYTE_SIZE;
 
     /// Convert to bytes representation
     pub fn to_bytes(&self) -> [u8; Self::BYTE_SIZE] {
         let mut buf = [0; Self::BYTE_SIZE];
 
-        buf[0..2].copy_from_slice(&self.term.0.to_be_bytes());
-        buf[2..].copy_from_slice(&self.offset.0.to_be_bytes());
+        buf[0..TermId::BYTE_SIZE].copy_from_slice(&self.term.0.to_be_bytes());
+        buf[TermId::BYTE_SIZE..].copy_from_slice(&self.offset.0.to_be_bytes());
 
         buf
     }
@@ -132,11 +132,12 @@ impl FromStr for NodeId {
 #[derive(Copy, Clone, Debug, BinRead, BinWrite, PartialEq, Eq)]
 #[br(big)]
 #[bw(big)]
-pub struct TermId(pub u16);
+pub struct TermId(pub u32);
 
 impl TermId {
-    pub const BYTE_SIZE: usize = 2;
+    pub const BYTE_SIZE: usize = 4;
 }
+
 /// A size of an entry
 ///
 /// Even though the type here is `u32`, we store (read&write)
@@ -150,6 +151,10 @@ pub struct EntrySize(
     #[bw(big, write_with(EntrySize::write))]
     pub u32,
 );
+
+impl EntrySize {
+    pub const BYTE_SIZE: usize = 3;
+}
 
 impl EntrySize {
     fn parse<R: Read + Seek>(reader: &mut R, _endian: Endian, _: ()) -> binrw::BinResult<u32> {
