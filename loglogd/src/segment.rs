@@ -5,6 +5,7 @@ use std::{
     io::{BufReader, Cursor, Seek},
     os::fd::{AsRawFd, OwnedFd},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use binrw::{io, BinRead, BinWrite};
@@ -91,7 +92,7 @@ pub struct SegmentFileMeta {
     pub id: SegmentId,
 
     /// Path to a segment file, to avoid allocating to calculate it during normal operations
-    pub path: PathBuf,
+    pub path: Arc<PathBuf>,
 
     /// File length
     pub file_len: u64,
@@ -102,16 +103,19 @@ impl SegmentFileMeta {
         Self {
             id: id.into(),
             file_len,
-            path,
+            path: Arc::new(path),
         }
     }
 
-    pub(crate) fn path(&self) -> &Path {
+    pub fn path_ref(&self) -> &Path {
         &self.path
     }
 
+    pub fn path(&self) -> Arc<PathBuf> {
+        self.path.clone()
+    }
     /// Calculate path for a segment file of a given id
-    pub(crate) fn get_path(db_path: &Path, id: SegmentId) -> PathBuf {
+    pub fn get_path(db_path: &Path, id: SegmentId) -> PathBuf {
         let mut path = db_path.join(format!("{:016x}", id.0));
         path.set_extension(SegmentFileMeta::FILE_EXTENSION);
         path

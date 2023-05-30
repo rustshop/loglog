@@ -6,25 +6,29 @@ mod segment_sealer;
 mod segment_writer;
 
 use crate::db::{load_db, ScanError};
+use crate::ioutil::send_file_to_fd;
 use crate::node::peer_handler::PeerHandler;
 use crate::node::rpc_handler::RpcHandler;
 use crate::node::segment_preallocator::SegmentPreallocator;
 use crate::node::segment_sealer::SegmentSealer;
 use crate::node::segment_writer::SegmentWriter;
 use crate::raft::{self, PeerState};
-use crate::segment::{OpenSegment, PreallocatedSegment, SegmentId, SegmentMeta};
+use crate::segment::{OpenSegment, PreallocatedSegment, SegmentFileHeader, SegmentId, SegmentMeta};
 use crate::task::PanicGuard;
+use convi::ExpectFrom;
 use loglogd_api::{AllocationId, EntryHeader, EntrySize, EntryTrailer, LogOffset, NodeId, TermId};
 use signal_hook::consts::TERM_SIGNALS;
 use signal_hook::flag;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv6Addr, SocketAddr};
-use std::path::PathBuf;
+use std::os::fd::{AsRawFd, RawFd};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, RwLock};
-use std::{io, ops};
+use std::{cmp, io, ops};
 use thiserror::Error;
+use tokio::net::{TcpSocket, TcpStream};
 use tracing::{debug, info, trace};
 use typed_builder::TypedBuilder;
 
@@ -288,6 +292,136 @@ impl NodeShared {
             .last_key_value()
             .map(|(_, last_sealed_segment)| last_sealed_segment.content_meta.end_log_offset)
     }
+
+    pub fn find_log_data_from_sealed(
+        &self,
+        log_offset: LogOffset,
+        len: u64,
+    ) -> Option<(Arc<PathBuf>, u64, u64)> {
+        let segment = {
+            let sealed_segments = &self.sealed_segments.read().expect("Locking failed");
+            let Some(segment) = sealed_segments.get_containing_offset(log_offset) else {
+                        // if we couldn't find any segments below `log_offset`, that must
+                        // mean there are no sealed segments at all, otherwise there wouldn't
+                        // be any commited bytes to send and we wouldn't be here
+                        debug_assert!(sealed_segments.is_empty());
+                        return None;
+                    };
+            segment.clone()
+        };
+
+        if segment.content_meta.end_log_offset <= log_offset {
+            // Offset after last sealed segments. `log_offset` must be in an opened segment then.
+            return None;
+        }
+
+        debug_assert!(segment.content_meta.start_log_offset <= log_offset);
+        let bytes_available_in_segment = segment.content_meta.end_log_offset - log_offset;
+        let file_offset =
+            log_offset - segment.content_meta.start_log_offset + SegmentFileHeader::BYTE_SIZE_U64;
+
+        debug_assert!(0 < bytes_available_in_segment);
+
+        let bytes_to_send = cmp::min(bytes_available_in_segment, len);
+        Some((segment.file_meta.path(), file_offset, bytes_to_send))
+    }
+
+    pub fn find_log_data_from_open(
+        &self,
+        log_offset: LogOffset,
+        len: u64,
+    ) -> Option<(Arc<OpenSegment>, u64, u64)> {
+        let (segment, segment_end_log_offset) = {
+            let read_open_segments = self.open_segments.read().expect("Locking failed");
+
+            let Some(segment) = read_open_segments.get_containing_offset(log_offset).cloned() else {
+                    // This means we couldn't find a matching open segment. This
+                    // must be because we missed a segment that was moved between
+                    // opened and sealed group.
+                    return None;
+                };
+
+            // Since segments are closed in order, from lowest offset upward,
+            // if we were able to find an open segment starting just before the
+            // requested offset, the whole data must be in this segment. The question
+            // is only how much of it can we serve, before switching
+            // to next segment.
+
+            let segment_end_log_offset =
+                if let Some(segment) = read_open_segments.get_after_containing_offset(log_offset) {
+                    segment.start_log_offset
+                } else {
+                    // No open segments after current one (at least yet).
+                    // Just use request data as the end pointer
+                    log_offset + len
+                };
+
+            (segment, segment_end_log_offset)
+        };
+
+        debug_assert!(segment.start_log_offset <= log_offset);
+        let bytes_available_in_segment = segment_end_log_offset - log_offset;
+        let file_offset = log_offset - segment.start_log_offset + SegmentFileHeader::BYTE_SIZE_U64;
+
+        debug_assert!(0 < bytes_available_in_segment);
+
+        let bytes_to_send = cmp::min(bytes_available_in_segment, len);
+
+        Some((segment, file_offset, bytes_to_send))
+    }
+
+    pub fn find_log_data(&self, log_offset: LogOffset, len: u64) -> LogData {
+        // Should never request data is not yet durable
+        debug_assert!(log_offset + len <= self.fsynced_log_offset());
+
+        if let Some((path, offset, len)) = self.find_log_data_from_sealed(log_offset, len) {
+            return LogData {
+                source: LogDataSource::Sealed(path),
+                offset,
+                len,
+            };
+        }
+        if let Some((segment, offset, len)) = self.find_log_data_from_open(log_offset, len) {
+            return LogData {
+                source: LogDataSource::Open(segment),
+                offset,
+                len,
+            };
+        }
+
+        panic!("Could not find data for {log_offset} of size {len}. Writer was supposed to guarantee we can't miss a chunk");
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LogData {
+    source: LogDataSource,
+    offset: u64,
+    len: u64,
+}
+
+impl LogData {
+    fn write_to_fd(&self, dst_fd: RawFd) -> io::Result<u64> {
+        match self.source {
+            LogDataSource::Sealed(ref sealed) => {
+                // TODO(perf): we should cache FDs to open sealed files somewhere in some LRU
+                let file = std::fs::File::open(sealed.as_ref())?;
+                let src_fd = file.as_raw_fd();
+                send_file_to_fd(src_fd, self.offset, dst_fd, self.len)
+            }
+            LogDataSource::Open(ref open) => {
+                let src_fd = open.fd.as_raw_fd();
+
+                send_file_to_fd(src_fd, self.offset, dst_fd, self.len)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum LogDataSource {
+    Sealed(Arc<PathBuf>),
+    Open(Arc<OpenSegment>),
 }
 
 pub struct NodeCtrl {

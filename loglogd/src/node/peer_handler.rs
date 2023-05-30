@@ -6,7 +6,7 @@ use std::{
 };
 
 use binrw::{io::NoSeek, BinWrite};
-use loglogd_api::{AllocationId, LogOffset};
+use loglogd_api::{peer::Update, AllocationId, LogOffset};
 use tokio::{
     net::{TcpListener, TcpStream},
     time::{self, sleep, timeout},
@@ -172,8 +172,8 @@ impl PeerHandlerEgress {
     async fn send_update(&self, conn: &mut TcpStream) -> anyhow::Result<()> {
         let last_fsynced_offset = self.shared.fsynced_log_offset();
 
-        let mut buf = [0; 1234];
-        (loglogd_api::peer::Update {
+        let mut buf = [0; Update::BYTE_SIZE];
+        (Update {
             current_term: self.shared.persistent_state.current_term,
             // TODO
             start: self.last_log_offset.expect("TODO: Not implemented"),

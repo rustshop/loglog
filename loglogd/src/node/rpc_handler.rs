@@ -365,121 +365,114 @@ impl RpcHandlerInner {
         Ok(())
     }
 
-    /// Send as much data (under `data_to_send` limit) from the log at `log_offset` as possible
-    async fn handle_read_request_send_data(
-        &self,
-        stream: &mut TcpStream,
-        log_offset: &mut LogOffset,
-        num_bytes_to_send: &mut u32,
-    ) -> ConnectionResult<()> {
-        // first try serving from sealed files
-        while 0 < *num_bytes_to_send {
-            let segment = {
-                let sealed_segments = &self.shared.sealed_segments.read().expect("Locking failed");
-                let Some(segment) = sealed_segments.get_containing_offset(*log_offset) else {
-                        // if we couldn't find any segments below `log_offset`, that must
-                        // mean there are no sealed segments at all, otherwise there wouldn't
-                        // be any commited bytes to send and we wouldn't be here
-                        debug_assert!(sealed_segments.is_empty());
-                        break;
-                    };
-                segment.clone()
-            };
+    // /// Send as much data (under `data_to_send` limit) from the log at `log_offset` as possible
+    // async fn handle_read_request_send_data(
+    //     &self,
+    //     stream: &mut TcpStream,
+    //     log_offset: &mut LogOffset,
+    //     num_bytes_to_send: &mut u32,
+    // ) -> ConnectionResult<()> {
+    //     // first try serving from sealed files
+    //     while 0 < *num_bytes_to_send {
+    //         let segment = {
+    //             let sealed_segments = &self.shared.sealed_segments.read().expect("Locking failed");
+    //             let Some(segment) = sealed_segments.get_containing_offset(*log_offset) else {
+    //                     // if we couldn't find any segments below `log_offset`, that must
+    //                     // mean there are no sealed segments at all, otherwise there wouldn't
+    //                     // be any commited bytes to send and we wouldn't be here
+    //                     debug_assert!(sealed_segments.is_empty());
+    //                     break;
+    //                 };
+    //             segment.clone()
+    //         };
 
-            if segment.content_meta.end_log_offset <= *log_offset {
-                // Offset after last sealed segments. `log_offset` must be in an opened segment then.
-                // Break into the open segment loop search.
-                break;
-            }
+    //         if segment.content_meta.end_log_offset <= *log_offset {
+    //             // Offset after last sealed segments. `log_offset` must be in an opened segment then.
+    //             // Break into the open segment loop search.
+    //             break;
+    //         }
 
-            debug_assert!(segment.content_meta.start_log_offset <= *log_offset);
-            let bytes_available_in_segment = segment.content_meta.end_log_offset - *log_offset;
-            let file_offset = *log_offset - segment.content_meta.start_log_offset
-                + SegmentFileHeader::BYTE_SIZE_U64;
+    //         debug_assert!(segment.content_meta.start_log_offset <= *log_offset);
+    //         let bytes_available_in_segment = segment.content_meta.end_log_offset - *log_offset;
+    //         let file_offset = *log_offset - segment.content_meta.start_log_offset
+    //             + SegmentFileHeader::BYTE_SIZE_U64;
 
-            debug_assert!(0 < bytes_available_in_segment);
+    //         debug_assert!(0 < bytes_available_in_segment);
 
-            let bytes_to_send = cmp::min(bytes_available_in_segment, u64::from(*num_bytes_to_send));
-            trace!(
-                bytes_to_send,
-                file_offset,
-                segment_id = %segment.file_meta.id,
-                "sending sealed segment data"
-            );
+    //         let bytes_to_send = cmp::min(bytes_available_in_segment, u64::from(*num_bytes_to_send));
+    //         trace!(
+    //             bytes_to_send,
+    //             file_offset,
+    //             segment_id = %segment.file_meta.id,
+    //             "sending sealed segment data"
+    //         );
 
-            let stream_fd = stream.as_raw_fd();
-            let bytes_written = tokio::task::spawn_blocking(move || -> io::Result<u64> {
-                // TODO(perf): we should cache FDs to open sealed files somewhere in some LRU
-                let file = std::fs::File::open(segment.file_meta.path())?;
-                let file_fd = file.as_raw_fd();
-                send_file_to_stream(file_fd, file_offset, stream_fd, bytes_to_send)
-            })
-            .await??;
+    //         let stream_fd = stream.as_raw_fd();
+    //         let bytes_written = tokio::task::spawn_blocking(move || -> io::Result<u64> {
+    //             // TODO(perf): we should cache FDs to open sealed files somewhere in some LRU
+    //             let file = std::fs::File::open(segment.file_meta.path_ref())?;
+    //             let file_fd = file.as_raw_fd();
+    //             send_file_to_stream(file_fd, file_offset, stream_fd, bytes_to_send)
+    //         })
+    //         .await??;
 
-            *num_bytes_to_send -= u32::expect_from(bytes_written);
-            *log_offset += bytes_written;
-        }
+    //         *num_bytes_to_send -= u32::expect_from(bytes_written);
+    //         *log_offset += bytes_written;
+    //     }
 
-        // if more data is still needed, it's probably in the still opened buffers
-        while 0 < *num_bytes_to_send {
-            let (segment, segment_end_log_offset) = {
-                let read_open_segments = self.shared.open_segments.read().expect("Locking failed");
+    //     // if more data is still needed, it's probably in the still opened buffers
+    //     while 0 < *num_bytes_to_send {
+    //         let (segment, segment_end_log_offset) = {
+    //             let read_open_segments = self.shared.open_segments.read().expect("Locking failed");
 
-                let Some(segment) = read_open_segments.get_containing_offset(*log_offset).cloned() else {
-                    // This means we couldn't find a matching open segment. This
-                    // must be because we missed a segment that was moved between
-                    // opened and sealed group.
-                    break;
-                };
+    //             let Some(segment) = read_open_segments.get_containing_offset(*log_offset).cloned() else {
+    //                 // This means we couldn't find a matching open segment. This
+    //                 // must be because we missed a segment that was moved between
+    //                 // opened and sealed group.
+    //                 break;
+    //             };
 
-                // Since segments are closed in order, from lowest offset upward,
-                // if we were able to find an open segment starting just before the
-                // requested offset, the whole data must be in this segment. The question
-                // is only how much of it can we serve, before switching
-                // to next segment.
+    //             // Since segments are closed in order, from lowest offset upward,
+    //             // if we were able to find an open segment starting just before the
+    //             // requested offset, the whole data must be in this segment. The question
+    //             // is only how much of it can we serve, before switching
+    //             // to next segment.
 
-                let segment_end_log_offset = if let Some(segment) =
-                    read_open_segments.get_after_containing_offset(*log_offset)
-                {
-                    segment.start_log_offset
-                } else {
-                    // No open segments after current one (at least yet).
-                    // Just use request data as the end pointer
-                    *log_offset + u64::from(*num_bytes_to_send)
-                };
+    //             let segment_end_log_offset = if let Some(segment) =
+    //                 read_open_segments.get_after_containing_offset(*log_offset)
+    //             {
+    //                 segment.start_log_offset
+    //             } else {
+    //                 // No open segments after current one (at least yet).
+    //                 // Just use request data as the end pointer
+    //                 *log_offset + u64::from(*num_bytes_to_send)
+    //             };
 
-                (segment, segment_end_log_offset)
-            };
+    //             (segment, segment_end_log_offset)
+    //         };
 
-            debug_assert!(segment.start_log_offset <= *log_offset);
-            let bytes_available_in_segment = segment_end_log_offset - *log_offset;
-            let file_offset =
-                *log_offset - segment.start_log_offset + SegmentFileHeader::BYTE_SIZE_U64;
+    //         debug_assert!(segment.start_log_offset <= *log_offset);
+    //         let bytes_available_in_segment = segment_end_log_offset - *log_offset;
+    //         let file_offset =
+    //             *log_offset - segment.start_log_offset + SegmentFileHeader::BYTE_SIZE_U64;
 
-            debug_assert!(0 < bytes_available_in_segment);
+    //         debug_assert!(0 < bytes_available_in_segment);
 
-            let bytes_to_send = cmp::min(bytes_available_in_segment, u64::from(*num_bytes_to_send));
+    //         let bytes_to_send = cmp::min(bytes_available_in_segment, u64::from(*num_bytes_to_send));
 
-            trace!(
-                bytes_to_send,
-                file_offset,
-                segment_id = %segment.id,
-                "sending open segment data"
-            );
+    //         let stream_fd = stream.as_raw_fd();
+    //         let file_fd = segment.fd.as_raw_fd();
 
-            let stream_fd = stream.as_raw_fd();
-            let file_fd = segment.fd.as_raw_fd();
+    //         let bytes_written = tokio::task::spawn_blocking(move || -> io::Result<u64> {
+    //             send_file_to_stream(file_fd, file_offset, stream_fd, bytes_to_send)
+    //         })
+    //         .await??;
 
-            let bytes_written = tokio::task::spawn_blocking(move || -> io::Result<u64> {
-                send_file_to_stream(file_fd, file_offset, stream_fd, bytes_to_send)
-            })
-            .await??;
-
-            *num_bytes_to_send -= u32::expect_from(bytes_written);
-            *log_offset += bytes_written;
-        }
-        Ok(())
-    }
+    //         *num_bytes_to_send -= u32::expect_from(bytes_written);
+    //         *log_offset += bytes_written;
+    //     }
+    //     Ok(())
+    // }
 
     async fn handle_read_request(
         &self,
@@ -496,8 +489,7 @@ impl RpcHandlerInner {
 
             let commited_data_available = last_fsynced_log_offset.saturating_sub(log_offset);
 
-            let num_bytes_to_send =
-                u32::expect_from(cmp::min(u64::from(limit.0), commited_data_available));
+            let num_bytes_to_send = cmp::min(u64::from(limit.0), commited_data_available);
 
             trace!(
                 %last_fsynced_log_offset,
@@ -520,7 +512,7 @@ impl RpcHandlerInner {
             }
         };
 
-        self.write_read_response_size(stream, num_bytes_to_send)
+        self.write_read_response_size(stream, u32::expect_from(num_bytes_to_send))
             .await?;
 
         // Because we have two sources of data (sealed and opened segments), and
@@ -528,9 +520,24 @@ impl RpcHandlerInner {
         // we possibly can miss some data between when the segment is closed
         // and added to sealed segments. But that's not a big issue, we can
         // loop and try again.
+        // NOTE: The above is actually incorrect, as segment sealer appends
+        // to sealed segments list first, only then removes from open segments list.
         while 0 < num_bytes_to_send {
-            self.handle_read_request_send_data(stream, &mut log_offset, &mut num_bytes_to_send)
-                .await?;
+            let log_data = self.shared.find_log_data(log_offset, num_bytes_to_send);
+
+            trace!(
+                log_data = ?log_data,
+                "sending log data"
+            );
+            let stream_fd = stream.as_raw_fd();
+            let bytes_written = tokio::task::spawn_blocking(move || -> io::Result<u64> {
+                log_data.write_to_fd(stream_fd)
+            })
+            .await??;
+            debug_assert!(bytes_written <= num_bytes_to_send);
+            log_offset += bytes_written;
+            num_bytes_to_send -= bytes_written;
+
             trace!(
                 %log_offset,
                 limit = limit.0,
@@ -558,32 +565,4 @@ impl RpcHandlerInner {
 
         Ok(())
     }
-}
-
-fn send_file_to_stream(
-    file_fd: RawFd,
-    mut file_offset: u64,
-    stream_fd: RawFd,
-    mut bytes_to_send: u64,
-) -> io::Result<u64> {
-    let mut bytes_written_total = 0u64;
-    while 0 < bytes_to_send {
-        let mut file_offset_mut: i64 = i64::expect_from(file_offset);
-        // TODO: fallback to `send`?
-        let bytes_sent = nix::sys::sendfile::sendfile64(
-            stream_fd,
-            file_fd,
-            Some(&mut file_offset_mut),
-            usize::expect_from(bytes_to_send),
-        )
-        .map_err(io::Error::from)?;
-
-        let bytes_sent = u64::expect_from(bytes_sent);
-
-        bytes_to_send -= bytes_sent;
-        file_offset += u64::expect_from(bytes_sent);
-        bytes_written_total += bytes_sent;
-    }
-
-    Ok(u64::expect_from(bytes_written_total))
 }
