@@ -1,10 +1,7 @@
 use loglogd_api::{NodeId, TermId};
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub struct PeerId(u8);
-
 #[allow(unused)] // TODO
-#[derive(Default)]
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub enum PeerState {
     #[default]
     // Follows the leader
@@ -16,13 +13,14 @@ pub enum PeerState {
     Leader,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct PersistentState {
     /// Our own `NodeId`
     pub id: NodeId,
     /// Current term we're aware of
     pub current_term: TermId,
     /// The peer we voted for in the `current_terrm`
-    pub voted_for: Option<PeerId>,
+    pub voted_for: Option<NodeId>,
 }
 
 #[allow(unused)] // TODO

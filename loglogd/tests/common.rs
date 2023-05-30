@@ -15,7 +15,7 @@ impl TestLoglogd {
     pub fn new() -> anyhow::Result<Self> {
         let dir = tempfile::tempdir()?;
         let params = Parameters::builder().data_dir(dir.path().to_owned());
-        let node = loglogd::Node::new(SocketAddr::from_str("[::]:0")?, params.build())?;
+        let node = loglogd::Node::new(params.build())?;
         Ok(Self {
             data_dir: dir,
             node: Some(node),
@@ -23,7 +23,7 @@ impl TestLoglogd {
     }
 
     pub fn local_addr(&self) -> SocketAddr {
-        self.node().get_ctrl().local_addr()
+        self.node().get_ctrl().rpc_addr()
     }
 
     pub fn node(&self) -> &loglogd::Node {

@@ -1,15 +1,25 @@
 use clap::Parser;
+use loglogd_api::NodeId;
 use std::num::ParseIntError;
 use std::str::FromStr;
 use std::{net::SocketAddr, path::PathBuf};
 
 #[derive(Parser, Debug, Clone)]
 pub struct Opts {
+    #[clap(long = "id")]
+    pub id: NodeId,
+
+    #[clap(long = "peer")]
+    pub peers: Vec<SocketAddr>,
+
     #[clap(long = "data-dir", default_value = "/var/lib/loglogd")]
     pub data_dir: PathBuf,
 
-    #[clap(long = "listen", default_value = "127.0.0.1:8080")]
-    pub listen: SocketAddr,
+    #[clap(long = "rpc-bind", default_value = "[::1]:19194")]
+    pub rpc_bind: SocketAddr,
+
+    #[clap(long = "peer-bind", default_value = "[::1]:19195")]
+    pub peer_bind: SocketAddr,
 
     #[clap(long = "segment-size", value_parser = parse_byte_unit)]
     pub base_segment_file_size: Option<u64>,

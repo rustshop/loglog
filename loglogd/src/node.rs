@@ -1,20 +1,24 @@
-mod request_handler;
+#![allow(unused)]
+mod peer_handler;
+mod rpc_handler;
 mod segment_preallocator;
 mod segment_sealer;
 mod segment_writer;
 
 use crate::db::{load_db, ScanError};
-use crate::node::request_handler::RequestHandler;
+use crate::node::peer_handler::PeerHandler;
+use crate::node::rpc_handler::RpcHandler;
 use crate::node::segment_preallocator::SegmentPreallocator;
 use crate::node::segment_sealer::SegmentSealer;
 use crate::node::segment_writer::SegmentWriter;
-use crate::raft;
-use crate::segment::{OpenSegment, PreallocatedSegment, SegmentMeta};
+use crate::raft::{self, PeerState};
+use crate::segment::{OpenSegment, PreallocatedSegment, SegmentId, SegmentMeta};
+use crate::task::PanicGuard;
 use loglogd_api::{AllocationId, EntryHeader, EntrySize, EntryTrailer, LogOffset, NodeId, TermId};
 use signal_hook::consts::TERM_SIGNALS;
 use signal_hook::flag;
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -27,6 +31,17 @@ use typed_builder::TypedBuilder;
 /// Some parameters of runtime operation
 #[derive(TypedBuilder, Debug, Clone)]
 pub struct Parameters {
+    #[builder(default = Parameters::DEFAULT_NODE_ID)]
+    pub id: NodeId,
+
+    #[builder(default = Parameters::DEFAULT_BIND_ADDR)]
+    pub rpc_bind: SocketAddr,
+    #[builder(default = Parameters::DEFAULT_BIND_ADDR)]
+    pub peer_bind: SocketAddr,
+
+    #[builder(default)]
+    pub peers: Vec<SocketAddr>,
+
     /// Base path where segment files are stored
     pub data_dir: PathBuf,
 
@@ -36,7 +51,10 @@ pub struct Parameters {
 }
 
 impl Parameters {
+    pub const DEFAULT_NODE_ID: NodeId = NodeId(0);
     pub const DEFAULT_BASE_SEGMENT_SIZE: u64 = 16 * 1024 * 1024;
+    pub const DEFAULT_BIND_ADDR: SocketAddr =
+        SocketAddr::new(std::net::IpAddr::V6(Ipv6Addr::LOCALHOST), 0);
 }
 
 /// Actively open segments
@@ -99,6 +117,14 @@ impl FromIterator<SegmentMeta> for SealedSegments {
 }
 
 impl SealedSegments {
+    pub fn next_segment_id(&self) -> SegmentId {
+        self.inner
+            .range(..)
+            .next_back()
+            .map(|segment| segment.1.file_meta.id.next())
+            .unwrap_or_default()
+    }
+
     /// `end_log_offset` of the last sealed segment
     pub fn end_log_offset(&self) -> Option<LogOffset> {
         self.inner
@@ -159,15 +185,28 @@ pub struct NodeShared {
     fsynced_log_offset: AtomicU64,
     /// Used to notify threads waiting for `fsynced_log_offset` to advance
     fsynced_log_offset_tx: tokio::sync::watch::Sender<LogOffset>,
+    fsynced_log_offset_rx: tokio::sync::watch::Receiver<LogOffset>,
 
     /// Last commited (globaly) log offset
     #[allow(unused)] // TODO
     commited_log_offset: AtomicU64,
+
+    // TODO: move or `Option` to allow disconnecting
+    raft_state_change_tx: tokio::sync::watch::Sender<raft::PeerState>,
+    raft_state_change_rx: tokio::sync::watch::Receiver<raft::PeerState>,
 }
 
 impl NodeShared {
+    pub fn panic_guard(&self, name: &'static str) -> PanicGuard {
+        PanicGuard::new(name, self.is_node_shutting_down.clone())
+    }
+
     pub fn fsynced_log_offset(&self) -> LogOffset {
         LogOffset::new(self.fsynced_log_offset.load(Ordering::SeqCst))
+    }
+
+    pub fn is_node_shutting_down(&self) -> bool {
+        self.is_node_shutting_down.load(Ordering::SeqCst)
     }
 
     pub fn update_fsynced_log_offset(&self, log_offset: LogOffset) {
@@ -253,12 +292,17 @@ impl NodeShared {
 
 pub struct NodeCtrl {
     is_node_shutting_down: Arc<AtomicBool>,
-    local_addr: SocketAddr,
+    rpc_addr: SocketAddr,
+    peer_addr: SocketAddr,
 }
 
 impl NodeCtrl {
-    pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
+    pub fn rpc_addr(&self) -> SocketAddr {
+        self.rpc_addr
+    }
+
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.peer_addr
     }
 
     pub fn stop(&self) {
@@ -277,18 +321,19 @@ impl NodeCtrl {
 pub struct Node {
     is_node_shutting_down: Arc<AtomicBool>,
     stop_on_drop: bool,
-    local_addr: SocketAddr,
     /// Thread preallocating new segments in parallel
     #[allow(unused)]
     segment_preallocator: SegmentPreallocator,
     /// Tokio executor running a tcp connection handling
     #[allow(unused)]
-    request_handler: RequestHandler,
+    rpc_handler: RpcHandler,
     /// Thread(s) handling writting out received entries to storage
     #[allow(unused)]
     segment_writer: SegmentWriter,
     #[allow(unused)]
     segment_sealer: SegmentSealer,
+    #[allow(unused)]
+    peer_handler: PeerHandler,
 }
 
 impl Drop for Node {
@@ -300,78 +345,65 @@ impl Drop for Node {
 }
 
 impl Node {
-    pub fn new(listen_addr: SocketAddr, params: Parameters) -> anyhow::Result<Self> {
+    pub fn new(params: Parameters) -> anyhow::Result<Self> {
         info!(
-            listen = %listen_addr,
+            rpc_bind = %params.rpc_bind,
+            peer_bind = %params.peer_bind,
             "data-dir" = %params.data_dir.display(),
             "Starting loglogd"
         );
 
-        let segments = load_db(&params.data_dir)?;
+        let segments = load_segments(&params)?;
+        let fsynced_log_offset = segments.end_log_offset().unwrap_or_default();
+        let next_segment_id = segments.next_segment_id();
 
-        // TODO: what to do with this check? It should not happen if
-        // there was no data loss or bugs. Should it delete segments past
-        // the inconsistency? That risks automatic loss of data. But
-        // any data recovery issues kind of do already...
-        for segments in segments.windows(2) {
-            if segments[0].content_meta.end_log_offset != segments[1].content_meta.start_log_offset
-            {
-                panic!(
-                    "offset inconsistency detected: {} {} != {} {}",
-                    segments[0].file_meta.id,
-                    segments[0].content_meta.end_log_offset,
-                    segments[1].file_meta.id,
-                    segments[1].content_meta.start_log_offset
-                );
-            }
-        }
-
-        let next_segment_id = segments
-            .last()
-            .map(|segment| segment.file_meta.id.next())
-            .unwrap_or_default();
+        let is_node_shutting_down = Arc::new(AtomicBool::new(false));
         let (entry_writer_tx, entry_writer_rx) = flume::bounded(16);
         let (future_segments_tx, future_segments_rx) = flume::bounded(4);
-        let (last_fsynced_log_offset_tx, last_fsynced_log_offset_rx) =
+        let (fsynced_log_offset_tx, fsynced_log_offset_rx) =
             tokio::sync::watch::channel(LogOffset::zero());
         let (last_written_entry_log_offset_tx, last_written_entry_log_offset_rx) =
             watch::channel(LogOffset::zero());
 
-        let is_node_shutting_down = Arc::new(AtomicBool::new(false));
-        let sealed_segments = SealedSegments::from_iter(segments);
-        let last_fsynced_offset = sealed_segments.end_log_offset();
+        let (raft_state_change_tx, raft_state_change_rx) =
+            tokio::sync::watch::channel(PeerState::default());
 
         let shared = Arc::new(NodeShared {
             is_segment_writer_done: AtomicBool::new(false),
             is_node_shutting_down: is_node_shutting_down.clone(),
             persistent_state: raft::PersistentState {
-                id: NodeId(0),
+                id: params.id,
                 current_term: TermId(0),
                 voted_for: None,
             },
             entry_buffer_pool: Mutex::new(vec![]),
             params: params.clone(),
             pending_entries: RwLock::new(PendingEntries {
-                next_available_log_offset: sealed_segments.end_log_offset().unwrap_or_default(),
+                next_available_log_offset: segments.end_log_offset().unwrap_or_default(),
                 entries: BTreeSet::new(),
             }),
-            sealed_segments: RwLock::new(sealed_segments),
+            sealed_segments: RwLock::new(segments),
             open_segments: RwLock::new(OpenSegments {
                 inner: BTreeMap::new(),
                 preallocated_segments_rx: future_segments_rx,
             }),
-            fsynced_log_offset: AtomicU64::new(last_fsynced_offset.unwrap_or_default().as_u64()),
-            fsynced_log_offset_tx: last_fsynced_log_offset_tx,
+            fsynced_log_offset: AtomicU64::new(fsynced_log_offset.as_u64()),
+            fsynced_log_offset_tx,
+            fsynced_log_offset_rx: fsynced_log_offset_rx.clone(),
             commited_log_offset: AtomicU64::new(0),
+            raft_state_change_tx,
+            raft_state_change_rx,
         });
 
-        let request_handler = RequestHandler::new(
+        let rpc_handler = RpcHandler::new(
             shared.clone(),
-            listen_addr,
+            params.rpc_bind,
             entry_writer_tx,
-            last_fsynced_log_offset_rx,
+            fsynced_log_offset_rx,
         )?;
-        let local_addr = request_handler.local_addr();
+
+        let segment_preallocator =
+            SegmentPreallocator::new(next_segment_id, params.clone(), future_segments_tx);
 
         let segment_writer = SegmentWriter::new(
             shared.clone(),
@@ -379,18 +411,16 @@ impl Node {
             last_written_entry_log_offset_tx,
         );
 
-        let segment_sealer = SegmentSealer::new(shared, last_written_entry_log_offset_rx);
+        let segment_sealer = SegmentSealer::new(shared.clone(), last_written_entry_log_offset_rx);
 
-        let segment_preallocator =
-            SegmentPreallocator::new(next_segment_id, params, future_segments_tx);
-
+        let peer_handler = PeerHandler::new(shared, params.peer_bind, params.peers)?;
         Ok(Node {
             stop_on_drop: true,
-            local_addr,
             segment_preallocator,
-            request_handler,
+            rpc_handler,
             segment_writer,
             segment_sealer,
+            peer_handler,
             is_node_shutting_down,
         })
     }
@@ -398,7 +428,8 @@ impl Node {
     pub fn get_ctrl(&self) -> NodeCtrl {
         NodeCtrl {
             is_node_shutting_down: Arc::clone(&self.is_node_shutting_down),
-            local_addr: self.local_addr,
+            rpc_addr: self.rpc_handler.local_addr(),
+            peer_addr: self.peer_handler.local_addr(),
         }
     }
 
@@ -407,4 +438,20 @@ impl Node {
         drop(self);
         info!("Node finished");
     }
+}
+
+fn load_segments(params: &Parameters) -> Result<SealedSegments, anyhow::Error> {
+    let segments = load_db(&params.data_dir)?;
+    for segments in segments.windows(2) {
+        if segments[0].content_meta.end_log_offset != segments[1].content_meta.start_log_offset {
+            panic!(
+                "offset inconsistency detected: {} {} != {} {}",
+                segments[0].file_meta.id,
+                segments[0].content_meta.end_log_offset,
+                segments[1].file_meta.id,
+                segments[1].content_meta.start_log_offset
+            );
+        }
+    }
+    Ok(SealedSegments::from_iter(segments))
 }

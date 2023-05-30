@@ -42,20 +42,20 @@ pub enum ConnectionError {
 
 pub type ConnectionResult<T> = std::result::Result<T, ConnectionError>;
 
-pub struct RequestHandler {
+pub struct RpcHandler {
     local_addr: SocketAddr,
     #[allow(unused)]
     join_handle: AutoJoinHandle,
 }
 
-impl RequestHandler {
+impl RpcHandler {
     pub fn new(
         shared: Arc<NodeShared>,
         listen_addr: SocketAddr,
         entry_writer_tx: flume::Sender<EntryWrite>,
         last_fsynced_log_offset_rx: watch::Receiver<LogOffset>,
     ) -> anyhow::Result<Self> {
-        let inner = Arc::new(RequestHandlerInner {
+        let inner = Arc::new(RpcHandlerInner {
             shared,
             entry_writer_tx,
             last_fsynced_log_offset_rx,
@@ -101,13 +101,13 @@ impl RequestHandler {
     }
 }
 
-pub struct RequestHandlerInner {
+pub struct RpcHandlerInner {
     shared: Arc<NodeShared>,
     pub last_fsynced_log_offset_rx: watch::Receiver<LogOffset>,
     entry_writer_tx: flume::Sender<EntryWrite>,
 }
 
-impl RequestHandlerInner {
+impl RpcHandlerInner {
     async fn handle_requests(self: &Arc<Self>, listener: TcpListener) {
         while !self.shared.is_node_shutting_down.load(Ordering::Relaxed) {
             let (mut stream, peer_addr) =
@@ -130,11 +130,13 @@ impl RequestHandlerInner {
             let self_copy = self.clone();
             tokio::spawn({
                 async move {
+                    let guard = self_copy.shared.panic_guard("peer-outgoing");
                     let mut buf = self_copy.shared.pop_entry_buffer();
                     if let Err(e) = self_copy.handle_connection(&mut stream, &mut buf).await {
                         info!("Connection error: {}", e);
                     }
                     self_copy.shared.put_entry_buffer(buf);
+                    guard.done();
                 }
             });
         }

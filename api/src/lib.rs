@@ -1,14 +1,18 @@
+mod log;
+pub mod peer;
+mod rpc;
+
 use binrw::{binrw, Endian};
 use binrw::{BinRead, BinWrite};
 use derive_more::Display;
 use std::io::Read;
 use std::io::Seek;
+use std::num::ParseIntError;
 use std::ops;
+use std::str::FromStr;
 
-mod net;
-pub use self::net::*;
+pub use self::rpc::*;
 
-mod log;
 pub use self::log::*;
 
 /// Logical offset in an the binary log stream
@@ -25,6 +29,9 @@ pub use self::log::*;
 #[bw(big)]
 pub struct LogOffset(u64);
 
+impl LogOffset {
+    pub const BYTE_SIZE: usize = 8;
+}
 impl ops::AddAssign<u64> for LogOffset {
     fn add_assign(&mut self, rhs: u64) {
         self.0 += rhs
@@ -113,12 +120,23 @@ fn allocation_id_serde() {
 #[br(big)]
 pub struct NodeId(pub u8);
 
+impl FromStr for NodeId {
+    type Err = ParseIntError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        FromStr::from_str(s).map(Self)
+    }
+}
+
 /// Raft term (election id)
 #[derive(Copy, Clone, Debug, BinRead, BinWrite, PartialEq, Eq)]
 #[br(big)]
 #[bw(big)]
 pub struct TermId(pub u16);
 
+impl TermId {
+    pub const BYTE_SIZE: usize = 2;
+}
 /// A size of an entry
 ///
 /// Even though the type here is `u32`, we store (read&write)
